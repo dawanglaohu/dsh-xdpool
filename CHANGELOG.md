@@ -1,6 +1,13 @@
 # Changelog
 本项目的所有重要变更都会记录在此文件。
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
+## 未发布 — 安装源改回本仓库
+> 这个 fork 修了两个上游还没修的问题，但 README 的首选安装方式仍然指向 npm 上的上游包 —— 照着装的人拿到的是没有这些修复的版本。
+### 改动
+- 安装源改为 `github:dawanglaohu/dsh-xdpool`（README 两种语言的首选方式）。`lib/` 构建产物本来就随仓库提交，所以 GitHub 安装不需要任何安装期脚本。
+- npm 方式降为次选，并明确标注：npm 上的 `dsh-xdpool` 归上游维护者，只发上游代码，不含本仓库的修复。
+- `package.json` 的 `homepage` / `bugs` / `repository` 与客户端卡片右上角的 Star 链接都指向本仓库；`author` 与 `LICENSE` 的版权署名保持上游 `XDTrees` 不变（MIT 要求保留原始版权声明）。
+- 顶部徽章：新增「install source: GitHub」指向本仓库，npm 版本徽章降级标注为 `npm (upstream)`。
 ## 未发布 — 模型饱和不再被当成账号限流
 > 一次「越换号越没得用」的雪崩：上游说「这个模型现在忙」，池子理解成「这个账号超限了」，于是把一个跟账号毫无关系的短暂拥堵，冷却成了整池一分钟不可用。
 ### 现象

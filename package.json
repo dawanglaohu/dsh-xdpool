@@ -5,13 +5,13 @@
   "version": "2.3.0",
   "license": "MIT",
   "author": "XDTrees",
-  "homepage": "https://github.com/XDTrees/dsh-xdpool#readme",
+  "homepage": "https://github.com/dawanglaohu/dsh-xdpool#readme",
   "bugs": {
-    "url": "https://github.com/XDTrees/dsh-xdpool/issues"
+    "url": "https://github.com/dawanglaohu/dsh-xdpool/issues"
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/XDTrees/dsh-xdpool.git"
+    "url": "git+https://github.com/dawanglaohu/dsh-xdpool.git"
   },
   "keywords": [
     "dsh-plugin",

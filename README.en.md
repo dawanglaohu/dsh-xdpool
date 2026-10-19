@@ -1,14 +1,15 @@
 # DSH XD Pool
 
 <p align="center">
-  <a href="https://www.npmjs.com/package/dsh-xdpool"><img src="https://img.shields.io/npm/v/dsh-xdpool?style=flat-square&label=npm&color=cb3837" alt="npm version"></a>
+  <a href="https://github.com/dawanglaohu/dsh-xdpool"><img src="https://img.shields.io/badge/install%20source-GitHub-181717?style=flat-square&logo=github" alt="install source"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/github/license/dawanglaohu/dsh-xdpool?style=flat-square" alt="MIT license"></a>
+  <a href="https://github.com/dawanglaohu/dsh-xdpool/stargazers"><img src="https://img.shields.io/github/stars/dawanglaohu/dsh-xdpool?style=flat-square" alt="GitHub stars"></a>
+  <a href="https://www.npmjs.com/package/dsh-xdpool"><img src="https://img.shields.io/npm/v/dsh-xdpool?style=flat-square&label=npm%20%28upstream%29&color=cb3837" alt="upstream npm version"></a>
   <a href="https://www.npmjs.com/package/dsh-workbuddy-xdpool"><img src="https://img.shields.io/badge/downloads-9k%2Fmo%20%28prev%20name%29-cb3837?style=flat-square" alt="npm downloads under the previous name"></a>
-  <a href="LICENSE"><img src="https://img.shields.io/github/license/XDTrees/dsh-xdpool?style=flat-square" alt="MIT license"></a>
-  <a href="https://github.com/XDTrees/dsh-xdpool/stargazers"><img src="https://img.shields.io/github/stars/XDTrees/dsh-xdpool?style=flat-square" alt="GitHub stars"></a>
 </p>
 
 <p align="center">
-  <sub>Download stats still come from the previous package name <code>dsh-workbuddy-xdpool</code> (8,976/month as of 2026-10-12 — every download before the rename; the live shields badge kept getting rate-limited by the npm upstream, hence the snapshot figure). The new <code>dsh-xdpool</code> package accumulates its own stats, and the badge switches back to live data later.</sub>
+  <sub>The install source is this repository, <code>github:dawanglaohu/dsh-xdpool</code>. The npm package <code>dsh-xdpool</code> belongs to the upstream maintainer and only ships upstream code — none of this fork's fixes. Download stats still come from the previous package name <code>dsh-workbuddy-xdpool</code> (8,976/month as of 2026-10-12 — every download before the rename; the live shields badge kept getting rate-limited by the npm upstream, hence the snapshot figure).</sub>
 </p>
 
 English | [中文](./README.md)
@@ -118,27 +119,30 @@ Prerequisite: the WorkBuddy desktop app installed and signed in (the plugin reus
 
 > Compatible with the `0.1.1-rc.2` / `0.1.2` host line: the settings section installs via `settings.installSection` (0.1.2-rc.1+) or the earlier free-function form, whichever the host supports.
 
-**Option A — install from npm (recommended)**
+**Option A — install from this repository (recommended)**
 
 ```sh
 # if dsh is not on PATH, use node ~/.dsh/profiles/node_modules/@deepseek-ai/dsh/lib/bin.js instead
+dsh plugin --profile desktop add github:dawanglaohu/dsh-xdpool
+```
+
+> This repository is the install source. The `lib/` build output is committed, so installing needs no install-time script and never trips pnpm's "build scripts were blocked" prompt.
+> The cost is that the dev dependencies come along (bundler, test runner, hundreds of packages), so the first install is slower than npm.
+
+**Option B — install from npm (upstream package, without this fork's changes)**
+
+```sh
 dsh plugin --profile desktop add dsh-xdpool
 ```
 
-> npm is the fast path: the only dependency pulled in is the plugin itself (**roughly 1 package, a few seconds**).
-> Installing from the GitHub source drags in the dev dependencies (bundler, test runner, hundreds of packages) and is much slower.
-
-**Option B — install from the GitHub source**
-
-```sh
-dsh plugin --profile desktop add github:XDTrees/dsh-xdpool
-```
+> The npm package `dsh-xdpool` belongs to the upstream author `XDTrees` and ships upstream code. This fork carries fixes on top of it (the gateway 400 / code 11128 session-identity headers, and model saturation 14003 no longer cooling the whole pool) — **those changes exist only in the GitHub source**. Take Option A if you want this fork's behaviour.
+> The upside is that the only dependency pulled in is the plugin itself, a few seconds.
 
 **Option C — register the bundle by hand**
 
 ```sh
-# 1) install the package (npm or GitHub)
-dsh plugin --profile desktop add dsh-xdpool
+# 1) install the package (GitHub or npm, see above)
+dsh plugin --profile desktop add github:dawanglaohu/dsh-xdpool
 
 # 2) register the bundle: edit ~/.dsh/profiles/desktop/package.json and append
 #    "dsh-xdpool" to the end of the "dsh" → "profile" → "bundles" array

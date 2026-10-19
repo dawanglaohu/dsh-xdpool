@@ -213,7 +213,7 @@ export function PoolShell({
         </div>
         <a
           className="dsm-xdpool-star"
-          href="https://github.com/XDTrees/dsh-xdpool"
+          href="https://github.com/dawanglaohu/dsh-xdpool"
           target="_blank"
           rel="noreferrer"
           title={t?.('shell.starHint') ?? 'Open this plugin on GitHub'}

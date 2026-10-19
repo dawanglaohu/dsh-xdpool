@@ -1,14 +1,15 @@
 # DSH XD Pool
 
 <p align="center">
-  <a href="https://www.npmjs.com/package/dsh-xdpool"><img src="https://img.shields.io/npm/v/dsh-xdpool?style=flat-square&label=npm&color=cb3837" alt="npm version"></a>
+  <a href="https://github.com/dawanglaohu/dsh-xdpool"><img src="https://img.shields.io/badge/install%20source-GitHub-181717?style=flat-square&logo=github" alt="install source"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/github/license/dawanglaohu/dsh-xdpool?style=flat-square" alt="MIT license"></a>
+  <a href="https://github.com/dawanglaohu/dsh-xdpool/stargazers"><img src="https://img.shields.io/github/stars/dawanglaohu/dsh-xdpool?style=flat-square" alt="GitHub stars"></a>
+  <a href="https://www.npmjs.com/package/dsh-xdpool"><img src="https://img.shields.io/npm/v/dsh-xdpool?style=flat-square&label=npm%20%28upstream%29&color=cb3837" alt="upstream npm version"></a>
   <a href="https://www.npmjs.com/package/dsh-workbuddy-xdpool"><img src="https://img.shields.io/badge/downloads-9k%2F%E6%9C%88%20%28%E6%97%A7%E5%90%8D%29-cb3837?style=flat-square" alt="npm downloads under the previous name"></a>
-  <a href="LICENSE"><img src="https://img.shields.io/github/license/XDTrees/dsh-xdpool?style=flat-square" alt="MIT license"></a>
-  <a href="https://github.com/XDTrees/dsh-xdpool/stargazers"><img src="https://img.shields.io/github/stars/XDTrees/dsh-xdpool?style=flat-square" alt="GitHub stars"></a>
 </p>
 
 <p align="center">
-  <sub>下载量统计沿用旧包名 <code>dsh-workbuddy-xdpool</code>（截至 2026-10-12 为 8,976 次/月，改名前的全部下载；shields 的实时徽章常被 npm 上游限流，所以这里用了快照数字）。新包 <code>dsh-xdpool</code> 的统计会随时间累积，之后徽章会换回实时数据。</sub>
+  <sub>安装源是本仓库 <code>github:dawanglaohu/dsh-xdpool</code>；npm 上的 <code>dsh-xdpool</code> 归上游维护者，只发上游代码，不含本仓库的修复。下载量统计沿用旧包名 <code>dsh-workbuddy-xdpool</code>（截至 2026-10-12 为 8,976 次/月，改名前的全部下载；shields 的实时徽章常被 npm 上游限流，所以这里用了快照数字）。</sub>
 </p>
 
 [English](./README.en.md) | 中文
@@ -125,27 +126,30 @@
 > 面板顶部是平级标签：`通用设置 / 模型 / 内置插件 / Agent 预设 / XD Pool` —— 本插件就是最后那个 **XD Pool**。
 > （0.1.x 时代它叫「设置 → 插件 → DSH WorkBuddy XD Pool」，0.2.0 起改成了平级标签，按老路径找不到。）
 
-**方式一：从 npm 安装（推荐）**
+**方式一：从本仓库安装（推荐）**
 
 ```sh
 # dsh 不在 PATH 时，用 node ~/.dsh/profiles/node_modules/@deepseek-ai/dsh/lib/bin.js 代替 dsh
+dsh plugin --profile desktop add github:dawanglaohu/dsh-xdpool
+```
+
+> 本仓库就是安装源。`lib/` 构建产物已随仓库提交，所以装的时候不需要任何安装期脚本，也不会弹 pnpm 那句「构建脚本被拦截，请放行」。
+> 代价是会连带拉取开发依赖（构建器、测试框架等几百个包），第一次装比 npm 慢。
+
+**方式二：从 npm 安装（上游包，不含本仓库的改动）**
+
+```sh
 dsh plugin --profile desktop add dsh-xdpool
 ```
 
-> 推荐 npm：需要拉取的依赖只有插件自己（**约 1 个包，几秒搞定**）。
-> 从 GitHub 源码装会连带装开发依赖（构建器、测试框架等几百个包），慢得多。
-
-**方式二：从 GitHub 源码安装**
-
-```sh
-dsh plugin --profile desktop add github:XDTrees/dsh-xdpool
-```
+> npm 上的 `dsh-xdpool` 归上游 `XDTrees` 所有，发布的是上游代码。本仓库在上游之上做了修复（网关 400 / code 11128 的会话标识头、模型饱和 14003 不再误冷却整池），**那些改动只存在于 GitHub 源**。要本仓库的行为就走方式一。
+> 好处是只拉插件自己一个包，几秒搞定。
 
 **方式三：手动注册 bundle**
 
 ```sh
-# 1) 先装包（npm 或 GitHub 任选）
-dsh plugin --profile desktop add dsh-xdpool
+# 1) 先装包（GitHub 或 npm 任选，见上）
+dsh plugin --profile desktop add github:dawanglaohu/dsh-xdpool
 
 # 2) 注册 bundle：编辑 ~/.dsh/profiles/desktop/package.json，
 #    在 "dsh" → "profile" → "bundles" 数组末尾加上 "dsh-xdpool"
