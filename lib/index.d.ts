@@ -192,7 +192,16 @@ interface ChatMessage {
 //#endregion
 //#region src/upstream.d.ts
 /** Upstream failure classes the shim maps onto distinct HTTP answers. */
-type UpstreamErrorKind = 'hard_credit' | 'soft_rate' | 'session_dead' | 'not_found' | 'server' | 'client';
+type UpstreamErrorKind = 'hard_credit' |
+/** This ACCOUNT is rate-limited on this model: cool it and rotate. */
+'soft_rate' |
+/**
+ * This MODEL's queue is full (business code 14003) — nothing to do with the
+ * account. Every account in the pool is refused at the same moment, so this
+ * class must neither cool anything nor rotate: the caller re-asks the same
+ * account shortly, or the user switches model.
+ */
+'model_busy' | 'session_dead' | 'not_found' | 'server' | 'client';
 /** Token-refresh answer; fields the upstream omits stay absent. */
 interface WorkBuddyRefreshOutcome {
   accessToken: string;
@@ -2737,6 +2746,13 @@ interface WorkBuddyShimOptions {
   region?: WorkBuddyRegion;
   /** Max accounts to try per request before giving up. */
   maxAttempts?: number;
+  /**
+   * Backoffs for re-asking the SAME account when the MODEL reports saturation
+   * (14003). Defaults to two retries; `[]` makes the first refusal final, which
+   * is what a test wants when it is asserting the classification rather than the
+   * wait.
+   */
+  saturationRetryDelaysMs?: readonly number[];
   /**
    * Where per-call usage goes.
    *

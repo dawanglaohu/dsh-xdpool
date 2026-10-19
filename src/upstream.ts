@@ -20,7 +20,15 @@ import type { ChatMessage } from './context-budget.ts'
 /** Upstream failure classes the shim maps onto distinct HTTP answers. */
 export type UpstreamErrorKind =
   | 'hard_credit'
+  /** This ACCOUNT is rate-limited on this model: cool it and rotate. */
   | 'soft_rate'
+  /**
+   * This MODEL's queue is full (business code 14003) — nothing to do with the
+   * account. Every account in the pool is refused at the same moment, so this
+   * class must neither cool anything nor rotate: the caller re-asks the same
+   * account shortly, or the user switches model.
+   */
+  | 'model_busy'
   | 'session_dead'
   | 'not_found'
   | 'server'
@@ -272,6 +280,36 @@ const SESSION_DEAD_MARKERS = [
   'unauthorized', 'token expired', 'token is invalid',
   'login expired', 'please login', '未登录', '登录已失效', '重新登录',
 ]
+
+/**
+ * Business code for "this MODEL's queue is full" — 模型繁忙 / model busy.
+ *
+ * Distinct from a rate limit in the one way that matters to a pool: it is a
+ * property of the MODEL, not of the credential. The upstream says so itself
+ * ("这个模型当前请求量饱和，与你的网络无关。请换个模型，或稍等一会儿再重试")
+ * and it arrives as HTTP 429 with `msg: "too many requests"`, which is why the
+ * status-only rule below used to swallow it into `soft_rate` and cool every
+ * account in the pool for the same 60s — one busy model then reported
+ * "every account is rate-limited (6/6 cooling, tried 0)" without a single
+ * account having been tried.
+ */
+const MODEL_BUSY_BUSINESS_CODE = 14003
+
+/**
+ * Wording the same condition carries when the code is absent or restated.
+ *
+ * Kept narrow on purpose: `too many requests` is NOT here, because the
+ * upstream uses that exact phrase inside the 14003 body and a broader pattern
+ * would put a genuine rate limit back into the "retry, never cool" path.
+ */
+const MODEL_BUSY_PATTERN = /模型繁忙|请求量饱和|model\s+busy|currently\s+saturated/iu
+
+/** Does this body carry the model-saturation business code (or its wording)? */
+function isModelBusyBody(body: string): boolean {
+  if (MODEL_BUSY_PATTERN.test(body)) return true
+  const coded = /"code"\s*:\s*"?(\d+)"?/u.exec(body)
+  return coded !== null && Number(coded[1]) === MODEL_BUSY_BUSINESS_CODE
+}
 
 /**
  * Markers for "already checked in today".
@@ -702,6 +740,12 @@ export function classifyUpstreamError(status: number, body: string): UpstreamErr
   for (const marker of SESSION_DEAD_MARKERS) {
     if (body.includes(marker)) return 'session_dead'
   }
+  // Model saturation MUST be recognised before the status rule below: the
+  // upstream wraps 14003 in an HTTP 429, and answering that with `soft_rate`
+  // cools the account for a condition the account did not cause. With six
+  // accounts that turned one busy model into "6/6 cooling, tried 0" — the whole
+  // pool out of rotation for a minute without a single request sent.
+  if (isModelBusyBody(body)) return 'model_busy'
   // The 429 the user hits ("频率限制 / soft_rate / code 6004") routes here.
   if (status === 429) return 'soft_rate'
   if (body.includes('soft_rate') || body.includes('"code":6004') || body.includes('频率限制')) {

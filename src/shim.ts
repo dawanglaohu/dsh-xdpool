@@ -16,7 +16,7 @@
 import { createHash, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto'
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
 import { Readable, Transform } from 'node:stream'
-import type { WorkBuddyAccount, WorkBuddyAccountPool } from './accounts.ts'
+import type { WorkBuddyAccount, WorkBuddyAccountPool, WorkBuddyCredential } from './accounts.ts'
 import type { WorkBuddyCatalog } from './catalog.ts'
 import { parseRateLimitReset, WorkBuddyUpstreamClient, type ChatStreamResult, type UpstreamErrorKind, type WorkBuddyRegion } from './upstream.ts'
 import { compactWithSummary, estimateMessagesTokens, hardTruncate, type ChatMessage } from './context-budget.ts'
@@ -98,6 +98,13 @@ export interface WorkBuddyShimOptions {
   /** Max accounts to try per request before giving up. */
   maxAttempts?: number
   /**
+   * Backoffs for re-asking the SAME account when the MODEL reports saturation
+   * (14003). Defaults to two retries; `[]` makes the first refusal final, which
+   * is what a test wants when it is asserting the classification rather than the
+   * wait.
+   */
+  saturationRetryDelaysMs?: readonly number[]
+  /**
    * Where per-call usage goes.
    *
    * Optional so the CLI and the tests can run a shim with no dashboard: they
@@ -130,6 +137,10 @@ const LOOPBACK_HOSTS = new Set(['127.0.0.1', 'localhost', '[::1]'])
 const KIND_STATUS: Readonly<Record<UpstreamErrorKind, number>> = {
   hard_credit: 402,
   soft_rate: 429,
+  // The caller should retry, exactly like a rate limit — but nothing in the
+  // pool is penalised for it, so the 429 here reports model saturation rather
+  // than account exhaustion.
+  model_busy: 429,
   session_dead: 401,
   not_found: 502,
   server: 502,
@@ -287,6 +298,69 @@ function upstreamConversationId(key: string | undefined): string | undefined {
   return minted
 }
 
+/**
+ * How long to wait before re-asking the SAME account for a saturated model.
+ *
+ * Two retries, 2s then 4s — the model's queue drains in seconds, not minutes,
+ * and the caller is a live chat turn that should not sit silent much longer.
+ * Empty (`[]`) disables the in-place retry so a test (or a caller that would
+ * rather rotate) sees `model_busy` on the first answer.
+ */
+const SATURATION_RETRY_DELAYS_MS: readonly number[] = [2_000, 4_000]
+
+/** Sleep, but wake immediately when the request is aborted. */
+function waitUnlessAborted(ms: number, signal: AbortSignal): Promise<void> {
+  if (signal.aborted || ms <= 0) return Promise.resolve()
+  return new Promise<void>(resolve => {
+    const timer = setTimeout(finish, ms)
+    function finish(): void {
+      clearTimeout(timer)
+      signal.removeEventListener('abort', finish)
+      resolve()
+    }
+    signal.addEventListener('abort', finish, { once: true })
+  })
+}
+
+/**
+ * Ask the upstream for a chat stream, re-asking the SAME account while the
+ * MODEL reports saturation (business code 14003).
+ *
+ * WHY THIS IS NOT A ROTATION
+ *
+ * A rate limit belongs to a credential; saturation belongs to the model. The
+ * upstream says as much ("这个模型当前请求量饱和，与你的网络无关") and, because
+ * it arrives as HTTP 429, the pool used to file it as `soft_rate` and cool the
+ * account for a minute. Six accounts hitting one busy model therefore produced
+ * "every account is rate-limited (6/6 cooling, tried 0)": the whole pool out of
+ * rotation without a single request being sent, for a condition none of those
+ * accounts caused. Cooling nothing and rotating nowhere is the fix — the queue
+ * drains on its own, so the same account is re-asked after a short backoff.
+ */
+async function chatStreamWithSaturationRetry(
+  client: WorkBuddyUpstreamClient,
+  credential: WorkBuddyCredential,
+  prepared: string,
+  signal: AbortSignal,
+  conversationId: string | undefined,
+  label: string,
+  delays: readonly number[],
+  logger: ShimLogger | undefined,
+): Promise<ChatStreamResult> {
+  let result = await client.chatStream(credential, prepared, signal, conversationId)
+  for (const delayMs of delays) {
+    if (result.ok || result.kind !== 'model_busy' || signal.aborted) break
+    logger?.warn(
+      `dsh-xdpool: ${label} hit a saturated model (14003 model busy); `
+        + `re-asking the same account in ${delayMs}ms — saturation is model-wide, so rotating would hit the same wall`,
+    )
+    await waitUnlessAborted(delayMs, signal)
+    if (signal.aborted) break
+    result = await client.chatStream(credential, prepared, signal, conversationId)
+  }
+  return result
+}
+
 function readBody(req: IncomingMessage): Promise<Buffer> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = []
@@ -311,6 +385,7 @@ export function createWorkBuddyShim(options: WorkBuddyShimOptions): WorkBuddyShi
   const aggregate = options.aggregate
   const extra = options.extra
   const maxAttempts = options.maxAttempts ?? 8
+  const saturationDelays = options.saturationRetryDelaysMs ?? SATURATION_RETRY_DELAYS_MS
   // Per-process secret. The adapter resolves this as the OpenAI apiKey; the
   // shim never forwards it, because the real token comes from the pool.
   const SHARED_SECRET = randomBytes(32).toString('base64url')
@@ -708,6 +783,9 @@ function withBareModelId(raw: string, modelId: string): string {
         if (result.kind === 'soft_rate') pool.penalize(account.id, parseRateLimitReset(result.message), member.modelId)
         else if (result.kind === 'session_dead') pool.penalizeCredentialDead(account.id)
         else if (result.kind === 'hard_credit') pool.penalizeExhausted(account.id)
+        // `model_busy` cools nothing here either. Unlike the single-model lane,
+        // moving on is genuinely useful: the next chain member is a DIFFERENT
+        // model, so it is not standing in the same queue.
         continue
       }
       if (store === undefined || aggregate === undefined) {
@@ -762,12 +840,19 @@ function withBareModelId(raw: string, modelId: string): string {
     // as one model's 401.
     const kind = last?.kind ?? 'combo_empty'
     const status = last?.status ?? 503
+    // A chain whose last member was a saturated MODEL is not an account
+    // problem: every member was reachable, one of them was merely busy. Say so,
+    // otherwise the generic wording sends the user to re-sign in.
+    const busyNote = last?.kind === 'model_busy'
+      ? ' — that last member\'s MODEL was saturated upstream (14003), not rate-limited; '
+        + 'no account was cooled, so retry shortly or reorder the chain'
+      : ''
     writeOpenAIError(
       res,
       status,
       `combo_${kind}`,
       `chain ${row.id}: no member answered after ${attempts.length} [${attempts.join(' → ')}]`
-        + `: ${(last?.message ?? 'no member was reachable').slice(0, 300)}`,
+        + `: ${(last?.message ?? 'no member was reachable').slice(0, 300)}${busyNote}`,
     )
   }
   /**
@@ -948,11 +1033,15 @@ function withBareModelId(raw: string, modelId: string): string {
         return
       }
       tried.push(account.label)
-      const result = await client.chatStream(
+      const result = await chatStreamWithSaturationRetry(
+        client,
         account.credential,
         prepared,
         controller.signal,
         upstreamConversationId(conversationKey),
+        account.label,
+        saturationDelays,
+        logger,
       )
       if (result.ok) {
         // Success is filed by the stream forwarder, the only place that knows
@@ -1008,6 +1097,18 @@ function withBareModelId(raw: string, modelId: string): string {
         )
         continue
       }
+      // A saturated model was already re-asked in place (see
+      // `chatStreamWithSaturationRetry`). Reaching here means it stayed busy, and
+      // rotating would be theatre: saturation is a property of the MODEL, so the
+      // next account hits the same queue. Stop and report it as what it is.
+      if (result.kind === 'model_busy') {
+        logger?.warn(
+          `dsh-xdpool: model ${modelId ?? '(no model)'} is saturated upstream (14003) `
+            + `after ${saturationDelays.length} in-place retr${saturationDelays.length === 1 ? 'y' : 'ies'}; `
+            + 'not cooling or rotating — no account is at fault',
+        )
+        break
+      }
       // A `client` failure (HTTP 400) names no parameter when the upstream
       // leaves `extError.param` empty, which is the usual case — the user then
       // gets "the request parameters do not meet the current model requirements"
@@ -1056,6 +1157,7 @@ function withBareModelId(raw: string, modelId: string): string {
         client,
         pool,
         maxAttempts,
+        saturationDelays,
         usage: usageContext,
         contextWindow: modelId === undefined
           ? undefined
@@ -1067,6 +1169,25 @@ function withBareModelId(raw: string, modelId: string): string {
       }
       // The wording is a contract with the Harness; see `contextOverflowMessage`.
       writeOpenAIError(res, 400, 'context_length_exceeded', contextOverflowMessage(modelId, recovered.detail))
+      return
+    }
+    // A saturated model is the one failure where "which account" is the wrong
+    // question, so the generic "after N account(s) [labels]" line would mislead:
+    // it reads as an account problem and sends the user looking for credentials.
+    // Name the model, say the pool is fine, and point at the one action that
+    // helps — a different model, or a moment's wait.
+    if (last.kind === 'model_busy') {
+      writeOpenAIError(
+        res,
+        KIND_STATUS.model_busy,
+        'model_busy',
+        `model ${modelId ?? '(unknown)'} is saturated upstream (14003 model busy) after `
+          + `${saturationDelays.length} in-place retr${saturationDelays.length === 1 ? 'y' : 'ies'} `
+          + `on ${tried[0] ?? 'the pool'}; `
+          + 'this is the MODEL queue, not your quota — every account in the pool would be refused too. '
+          + 'Switch to another model, or retry shortly; no account was cooled and nothing needs re-signing in. '
+          + `Upstream said: ${last.message.slice(0, 240)}`,
+      )
       return
     }
     writeOpenAIError(
@@ -1275,6 +1396,8 @@ export interface RecoverOptions {
   client: WorkBuddyUpstreamClient
   pool: WorkBuddyAccountPool
   maxAttempts: number
+  /** In-place saturation backoffs, shared with the main lane. */
+  saturationDelays: readonly number[]
   /** True context window for the model, so the budget fits the real limit. */
   contextWindow?: number
   /**
@@ -1301,7 +1424,7 @@ export type RecoverResult =
  * caller then surfaces the original actionable 400.
  */
 async function recoverFromContextOverrun(options: RecoverOptions): Promise<RecoverResult> {
-  const { raw, modelId, controller, region, logger, client, pool, maxAttempts, usage } = options
+  const { raw, modelId, controller, region, logger, client, pool, maxAttempts, saturationDelays, usage } = options
   const parsed = client.parseChatBody(raw)
   if (parsed === undefined) return { ok: false, detail: 'request body was not parseable JSON' }
   const rawMessages = parsed['messages']
@@ -1381,11 +1504,15 @@ async function recoverFromContextOverrun(options: RecoverOptions): Promise<Recov
     const account = await pool.acquire(modelId, region)
     if (account === undefined) return { ok: false, detail: 'no account available after compaction' }
     tried.push(account.label)
-    const result = await client.chatStream(
+    const result = await chatStreamWithSaturationRetry(
+      client,
       account.credential,
       retryBody,
       controller.signal,
       upstreamConversationId(conversationKeyOf(retryBody)),
+      account.label,
+      saturationDelays,
+      logger,
     )
     if (!result.ok) {
       // A refusal is filed like any other failed physical call. The success
@@ -1422,6 +1549,11 @@ async function recoverFromContextOverrun(options: RecoverOptions): Promise<Recov
     if (result.kind === 'hard_credit') {
       pool.penalizeExhausted(account.id)
       continue
+    }
+    if (result.kind === 'model_busy') {
+      // Already re-asked in place; a different account stands in the same queue.
+      // Report saturation rather than looping the retry budget on a busy model.
+      return { ok: false, detail: `model ${modelId ?? '(no model)'} is saturated upstream (14003) after compaction` }
     }
     if (result.kind === 'soft_rate') {
       pool.penalize(account.id, parseRateLimitReset(result.message), modelId)
