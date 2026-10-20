@@ -34,6 +34,17 @@ export type UpstreamErrorKind =
   | 'not_found'
   | 'server'
   | 'client'
+  /**
+   * The request outgrew the model's context window (business code 11115). The
+   * transcript is intact — compacting it and retrying the same account is the
+   * answer, so this must not be terminal like `client`.
+   */
+  | 'context_overflow'
+  /**
+   * The transcript's tool calls and tool results no longer pair up (business
+   * code 11148). Repairable by dropping the orphaned half, not a bad request.
+   */
+  | 'tool_pairing'
 
 /** Token-refresh answer; fields the upstream omits stay absent. */
 export interface WorkBuddyRefreshOutcome {
@@ -75,6 +86,19 @@ export interface WorkBuddyUpstreamModel {
    * {@link isFreeModel}).
    */
   tags?: readonly string[]
+  /**
+   * Every context length the upstream declares this model accepts, ascending
+   * and de-duplicated — carried out of the object form of `contextWindow`
+   * (`supportedLengths`). Absent when the entry declares none.
+   */
+  supportedContextWindows?: readonly number[]
+  /**
+   * The size the upstream's own client asks for by default, when that is
+   * strictly smaller than {@link contextWindow} — carried so a caller can tell
+   * "the default ask" from "the largest accepted length". Omitted when it adds
+   * nothing.
+   */
+  defaultContextWindow?: number
 }
 
 /**
@@ -335,6 +359,51 @@ function isModelBusyBody(body: string): boolean {
   if (MODEL_BUSY_PATTERN.test(body)) return true
   const coded = /"code"\s*:\s*"?(\d+)"?/u.exec(body)
   return coded !== null && Number(coded[1]) === MODEL_BUSY_BUSINESS_CODE
+}
+
+/**
+ * Business codes and wordings for a request that outgrew the model's window.
+ *
+ * Recoverable, not terminal: the account is healthy and the model exists, only
+ * the transcript is too big, so the shim compacts and re-asks.
+ */
+const CONTEXT_OVERFLOW_CODE = 11115
+const CONTEXT_OVERFLOW_MARKERS = [
+  'prompt is too long',
+  'maximum context length',
+  'context_length_exceeded',
+  'input length too long',
+]
+
+/**
+ * Business codes and wordings for a broken tool call/result pairing.
+ *
+ * Also recoverable: a transcript whose tool records no longer pair is repaired
+ * by dropping the orphaned half, not by burning the pool on a terminal class.
+ */
+const TOOL_PAIRING_CODE = 11148
+const TOOL_PAIRING_MARKERS = ['tool calls and tool results do not match', 'Incomplete tool records']
+
+/** Does this body carry the given business code, however the gateway spaces it? */
+function hasBusinessCode(body: string, code: number): boolean {
+  const coded = /"code"\s*:\s*"?\s*(\d+)/u.exec(body)
+  return coded !== null && Number(coded[1]) === code
+}
+
+/** Does this body carry any of the markers? Case-insensitive on both sides. */
+function hasMarker(body: string, markers: readonly string[]): boolean {
+  const lower = body.toLowerCase()
+  return markers.some(marker => lower.includes(marker.toLowerCase()))
+}
+
+/** Is this body a context-window overflow? */
+function isContextOverflowBody(body: string): boolean {
+  return hasBusinessCode(body, CONTEXT_OVERFLOW_CODE) || hasMarker(body, CONTEXT_OVERFLOW_MARKERS)
+}
+
+/** Is this body a broken tool call/result pairing? */
+function isToolPairingBody(body: string): boolean {
+  return hasBusinessCode(body, TOOL_PAIRING_CODE) || hasMarker(body, TOOL_PAIRING_MARKERS)
 }
 
 /**
@@ -779,6 +848,12 @@ export function classifyUpstreamError(status: number, body: string): UpstreamErr
   }
   if (status === 404) return 'not_found'
   if (status >= 500) return 'server'
+  // Both of these arrive as HTTP 400, which the default below would call
+  // `client` — terminal in the shim, so one oversized or half-repaired
+  // transcript would end the request instead of being compacted and retried.
+  // Placed after every status rule above so those keep winning.
+  if (isContextOverflowBody(body)) return 'context_overflow'
+  if (isToolPairingBody(body)) return 'tool_pairing'
   return 'client'
 }
 
@@ -900,15 +975,70 @@ export function parseReasoning(value: unknown): WorkBuddyUpstreamModel['reasonin
   }
 }
 
+/** A positive finite integer, or `undefined` for anything else. */
+function positiveInt(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isInteger(value) && value > 0 ? value : undefined
+}
+
+/** The object form of `contextWindow`, when the entry uses it. */
+function contextWindowObject(raw: Record<string, unknown>): Record<string, unknown> | undefined {
+  const nested = raw['contextWindow']
+  if (typeof nested !== 'object' || nested === null || Array.isArray(nested)) return undefined
+  return nested as Record<string, unknown>
+}
+
+/** The largest usable entry of a declared length list, or `undefined`. */
+function maxLength(list: readonly number[] | undefined): number | undefined {
+  if (list === undefined || list.length === 0) return undefined
+  return list.reduce((left, right) => Math.max(left, right))
+}
+
+/**
+ * The model's effective context window: the largest length the upstream will
+ * actually accept, not the size its own client asks for by default.
+ *
+ * `defaultLength` is only the default request size — a live probe on
+ * `deepseek-v4.1-flash-sg` (`defaultLength:300000`, `maxAllowedSize:1000000`)
+ * was answered 200 at 1,000,019 prompt tokens and refused 11115 only at
+ * 1,150,035, so the ceiling is the largest declared length, never the default.
+ * Precedence: explicit scalar `contextWindow`, then the largest
+ * `supportedLengths` entry, then `maxAllowedSize`, then `defaultLength`, then
+ * `maxInputTokens`.
+ */
+function resolveContextWindow(raw: Record<string, unknown>): number | undefined {
+  const scalar = positiveInt(raw['contextWindow'])
+  if (scalar !== undefined) return scalar
+  const nested = contextWindowObject(raw)
+  return maxLength(resolveSupportedContextWindows(raw))
+    ?? positiveInt(raw['maxAllowedSize'])
+    ?? (nested === undefined ? undefined : positiveInt(nested['defaultLength']))
+    ?? positiveInt(raw['maxInputTokens'])
+}
+
+/**
+ * The full ladder of context lengths the object form of `contextWindow`
+ * declares, ascending and de-duplicated. `undefined` when the entry publishes
+ * no usable list, so the field is omitted rather than sent empty.
+ */
+function resolveSupportedContextWindows(raw: Record<string, unknown>): readonly number[] | undefined {
+  const declared = contextWindowObject(raw)?.['supportedLengths']
+  if (!Array.isArray(declared)) return undefined
+  const lengths = declared
+    .map((entry): number | undefined => positiveInt(entry))
+    .filter((entry): entry is number => entry !== undefined)
+  if (lengths.length === 0) return undefined
+  return [...new Set(lengths)].sort((left, right) => left - right)
+}
+
 /** Parse one catalog entry; entries without usable token limits are dropped. */
 export function parseUpstreamModel(value: unknown): WorkBuddyUpstreamModel | undefined {
   if (typeof value !== 'object' || value === null) return undefined
   const raw = value as Record<string, unknown>
   const id = typeof raw['id'] === 'string' ? raw['id'] : ''
   if (id === '' || raw['disabled'] === true) return undefined
-  const input = typeof raw['maxInputTokens'] === 'number' ? raw['maxInputTokens'] : 0
+  const contextWindow = resolveContextWindow(raw) ?? 0
   const output = typeof raw['maxOutputTokens'] === 'number' ? raw['maxOutputTokens'] : 0
-  if (input <= 0 || output <= 0) return undefined
+  if (contextWindow <= 0 || output <= 0) return undefined
   const name = typeof raw['name'] === 'string' && raw['name'] !== '' ? raw['name'] : id
   const descriptionZh = typeof raw['descriptionZh'] === 'string' && raw['descriptionZh'] !== '' ? raw['descriptionZh'] : undefined
   const descriptionEn = typeof raw['descriptionEn'] === 'string' && raw['descriptionEn'] !== '' ? raw['descriptionEn'] : undefined
@@ -922,10 +1052,15 @@ export function parseUpstreamModel(value: unknown): WorkBuddyUpstreamModel | und
   const tags = Array.isArray(raw['tags'])
     ? raw['tags'].filter((tag): tag is string => typeof tag === 'string' && tag !== '')
     : undefined
+  const supportedContextWindows = resolveSupportedContextWindows(raw)
+  const declaredDefault = positiveInt(contextWindowObject(raw)?.['defaultLength'])
+  const defaultContextWindow = declaredDefault !== undefined && declaredDefault < contextWindow
+    ? declaredDefault
+    : undefined
   return {
     id,
     name,
-    contextWindow: input,
+    contextWindow,
     maxTokens: output,
     ...creditMultiplier === undefined ? {} : { creditMultiplier },
     ...reasoning === undefined ? {} : { reasoning },
@@ -934,6 +1069,8 @@ export function parseUpstreamModel(value: unknown): WorkBuddyUpstreamModel | und
     ...supportsToolCall === undefined ? {} : { supportsToolCall },
     ...supportsImages === undefined ? {} : { supportsImages },
     ...tags === undefined || tags.length === 0 ? {} : { tags },
+    ...supportedContextWindows === undefined ? {} : { supportedContextWindows },
+    ...defaultContextWindow === undefined ? {} : { defaultContextWindow },
   }
 }
 

@@ -77,6 +77,8 @@ describe('channel route contract', () => {
       'account.delete',
       'account.list',
       'account.refresh',
+      'account.reset',
+      'account.retest',
       'account.test',
       'account.update',
       'credits.balances',

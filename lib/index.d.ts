@@ -201,7 +201,18 @@ type UpstreamErrorKind = 'hard_credit' |
  * class must neither cool anything nor rotate: the caller re-asks the same
  * account shortly, or the user switches model.
  */
-'model_busy' | 'session_dead' | 'not_found' | 'server' | 'client';
+'model_busy' | 'session_dead' | 'not_found' | 'server' | 'client' |
+/**
+ * The request outgrew the model's context window (business code 11115). The
+ * transcript is intact — compacting it and retrying the same account is the
+ * answer, so this must not be terminal like `client`.
+ */
+'context_overflow' |
+/**
+ * The transcript's tool calls and tool results no longer pair up (business
+ * code 11148). Repairable by dropping the orphaned half, not a bad request.
+ */
+'tool_pairing';
 /** Token-refresh answer; fields the upstream omits stay absent. */
 interface WorkBuddyRefreshOutcome {
   accessToken: string;
@@ -245,6 +256,19 @@ interface WorkBuddyUpstreamModel {
    * {@link isFreeModel}).
    */
   tags?: readonly string[];
+  /**
+   * Every context length the upstream declares this model accepts, ascending
+   * and de-duplicated — carried out of the object form of `contextWindow`
+   * (`supportedLengths`). Absent when the entry declares none.
+   */
+  supportedContextWindows?: readonly number[];
+  /**
+   * The size the upstream's own client asks for by default, when that is
+   * strictly smaller than {@link contextWindow} — carried so a caller can tell
+   * "the default ask" from "the largest accepted length". Omitted when it adds
+   * nothing.
+   */
+  defaultContextWindow?: number;
 }
 /** One billing package, already normalised. */
 interface WorkBuddyCreditPackage {

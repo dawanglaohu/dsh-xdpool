@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import {
-  MODEL_CONTEXT_CAP,
+  contextWindowChoice,
   formatModelCapacity,
   modelFactsFor,
   modelFigureLine,
@@ -124,7 +124,7 @@ describe('reads a window the way a person would say it out loud', () => {
 
 describe('turns facts into the line the card prints', () => {
   it('says nothing at all for a row that carried nothing', () => {
-    expect(modelFigureLine({})).toEqual({ capped: false })
+    expect(modelFigureLine({})).toEqual({})
   })
 
   it('carries the window, the ceiling and the levels through', () => {
@@ -138,7 +138,6 @@ describe('turns facts into the line the card prints', () => {
     expect(line.output).toBe('32.8K')
     expect(line.vision).toBe('both')
     expect(line.efforts).toBe('low / high')
-    expect(line.capped).toBe(false)
   })
 
   it('says text rather than leaving the figure out', () => {
@@ -148,28 +147,49 @@ describe('turns facts into the line the card prints', () => {
     expect(modelFigureLine({ vision: false }).vision).toBe('text')
   })
 
-  it('flags a window larger than this pool will serve, and prints the served one', () => {
-    // The cap is a serving limit, not a property of the model. Printing the
-    // published number as the figure would be the one way this line lies, so
-    // the figure is what the pool will actually give the model and the flag is
-    // what tells the user the model published more.
-    const line = modelFigureLine({ contextWindow: 4_000_000 })
-    expect(line.capped).toBe(true)
-    expect(line.context).toBe(formatModelCapacity(MODEL_CONTEXT_CAP))
-    expect(line.context).not.toBe(formatModelCapacity(4_000_000))
+  it('prints a published window at the size the model publishes', () => {
+    // This line used to clamp anything above 131 072 down to that number, on
+    // the theory that the pool lane served nothing larger. It does serve larger
+    // windows, so the clamp printed "131K" beside a model the picker in the same
+    // row offered at 1M, and the two figures contradicted each other.
+    expect(modelFigureLine({ contextWindow: 4_000_000 }).context).toBe(formatModelCapacity(4_000_000))
+    expect(modelFigureLine({ contextWindow: 1_000_000 }).context).toBe('1M')
+    expect(modelFigureLine({ contextWindow: 131_072 }).context).toBe('131K')
+  })
+})
+
+describe('resolves the context-window picker for a row the pack sent', () => {
+  const DEFAULT_BUDGET = 200_000
+
+  it('serves the full native window when no cap was ever set', () => {
+    // The pack sends neither nativeContextWindow nor contextBudget until the
+    // user narrows the model, so "no cap" has to read as "full window". Reading
+    // it as the conservative default left no radio selected for the full figure
+    // and made a 1M model look stuck at 200K.
+    const choice = contextWindowChoice({ contextWindow: 1_000_000 }, DEFAULT_BUDGET)
+    expect(choice.native).toBe(1_000_000)
+    expect(choice.budget).toBe(1_000_000)
+    expect(choice.capped).toBe(true)
   })
 
-  it('does not flag a window that exactly equals the cap', () => {
-    expect(modelFigureLine({ contextWindow: MODEL_CONTEXT_CAP }).capped).toBe(false)
+  it('reads the stored cap when one exists', () => {
+    const choice = contextWindowChoice(
+      { contextWindow: DEFAULT_BUDGET, nativeContextWindow: 1_000_000, contextBudget: DEFAULT_BUDGET },
+      DEFAULT_BUDGET,
+    )
+    expect(choice.native).toBe(1_000_000)
+    expect(choice.budget).toBe(DEFAULT_BUDGET)
+    expect(choice.capped).toBe(true)
   })
 
-  it('keeps the published window in the facts even when the figure shows the cap', () => {
-    // Clamping has to happen at print time, not at read time: the facts are also
-    // handed to anything else that reads this row, and it should see what the
-    // vendor published rather than what this pool happens to allow.
-    const facts: ModelFacts = { contextWindow: 4_000_000 }
-    expect(modelFactsFor(facts).contextWindow).toBe(4_000_000)
-    expect(modelFigureLine(facts).capped).toBe(true)
+  it('offers no picker for a model that cannot be narrowed', () => {
+    expect(contextWindowChoice({ contextWindow: DEFAULT_BUDGET }, DEFAULT_BUDGET).capped).toBe(false)
+    expect(contextWindowChoice({ contextWindow: 8_192 }, DEFAULT_BUDGET).capped).toBe(false)
+  })
+
+  it('offers no picker when the row published no window at all', () => {
+    const choice = contextWindowChoice({}, DEFAULT_BUDGET)
+    expect(choice).toEqual({ native: undefined, capped: false, budget: undefined })
   })
 })
 

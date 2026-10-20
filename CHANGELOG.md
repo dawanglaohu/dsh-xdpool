@@ -1,6 +1,56 @@
 # Changelog
 本项目的所有重要变更都会记录在此文件。
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
+## 未发布 — 1M 上下文模型真的能压缩了，渠道卡的窗口选择器不再永远停在 200K
+> 三件事收在一起：报出 1M 的模型此前根本压缩不了（外层按 1M 算阈值所以永不触发，真实上限只有 300K，撞上去之后内层的摘要请求自己又超窗，于是「压缩跑过了」却仍然 400）；渠道卡把「没设预算」显示成 200K，1M 那一档因此永远点不中；账号池补上「重测限流」「清除标记」，因为「测试连接」按设计不落盘，永远清不掉限流标记。
+### 上下文压缩：声明 1M 的模型一次都没压缩成功过
+> 报错原文是 `This model's maximum context length was exceeded: the prompt is too large for model deepseek-v4.1-flash-sg, and the conversation could not be compacted in place (upstream client after compaction)`。括号里那句 `after compaction` 是关键：压缩确实跑过了，是压缩**之后**的重试又被判成终态 `client`。
+#### 现象
+会话长到一定程度就必然死在这一条 400 上，且只发生在标称 1M 的模型（`deepseek-v4.1-flash-sg` 等）。换小窗口的模型反而没事，所以第一反应总是「模型窗口不够」，而实际窗口是够的——上游在 1,000,019 prompt tokens 时仍然 200，到 1,150,035 才回 11115。
+#### 根因：三层各自算对，合起来全错
+- **第一层（Harness 的 `dsh-compaction-basic`）**：它按适配器声明的窗口算压缩阈值。`parseUpstreamModel` 当时把 `maxInputTokens` 当成了 `contextWindow` 报上去，于是模型对外宣称 1M，阈值定在 800K —— 一个永远不会被撞到的数。
+- **第二层（真实上限）**：上游那个 `contextWindow` 是对象形态，`defaultLength:300000`、`maxAllowedSize:1000000`、`supportedLengths:[300000,1000000]`。真实可接受上限是最大声明长度 1M，但**默认请求尺寸只有 300K**，网关按默认尺寸布的一堆限制照样生效。会话在 300K～800K 之间一路畅通，直到某一轮突然 11115。
+- **第三层（shim 自己的恢复逻辑）**：它读 `catalog.current()` 拿到 1M，算出 budget ≈ 797952，然后让摘要器要 `floor(budget/2)` ≈ 398976 个输出 token —— **这个摘要请求本身就超窗**，必失败。失败后走原样重试，第二次 400 被 `classifyUpstreamError` 归成 `client`（当时 11115 没有专门的分类，落到默认分支），于是终态，抛出上面那句话。
+- 附带一层：头部截断会把一次工具调用切成两半（留下 `tool` 结果却没有声明它的 assistant，或反之），上游直接以 11148「tool calls and tool results do not match」拒绝——那是**格式**错不是**尺寸**错，再压一次也没用。
+#### 修法
+- `upstream.ts` 的 `resolveContextWindow` 改为按「真实可接受上限」取数：显式标量 `contextWindow` → `supportedLengths` 里最大的一项 → `maxAllowedSize` → `defaultLength` → 最后才回退 `maxInputTokens`。同时把整条阶梯作为 `supportedContextWindows` 带出来、把「上游自己默认要的尺寸」作为 `defaultContextWindow` 带出来（仅当它严格小于上限时才带，否则这个字段只是噪音）。依据是实测而不是文档：`defaultLength` 是默认请求尺寸，不是天花板。
+- `classifyUpstreamError` 新增两个**可恢复**分类：`context_overflow`（业务码 11115 及各种措辞）与 `tool_pairing`（11148）。这两个此前都落到 `client`，而 `client` 在轮转循环里是终态——账号健康、模型存在，只是这一条 prompt 有问题，绝不该就此放弃这一轮。
+- `shim.ts` 的恢复预算改为读 `effectiveWindowOf()`，走 `catalog.visible()` 而不是 `current()`：`visible()` 会应用用户的逐模型 `contextBudgets`。两层必须budget 同一个数——用户把模型限到 64K，恢复逻辑却按上游的 1M 算预算，结果就是「压缩完的 prompt」在 Harness 看来仍然远远超标。
+- 预算公式改成「已知窗口时按 80% 收缩」：`Math.max(512, Math.floor(realWindow * 0.8) - 2048)`，与超窗 token 数取小。80% 是给上游那些不写进窗口数字的额外开销（会话头、工具 schema）留的余量；2048 是留给回复本身的位置。
+- 摘要请求的 `max_tokens` 加硬顶 `SUMMARISER_MAX_TOKENS = 65536`，并且不超过该模型自己的 `maxOutputTokens`。摘要是一份简报，不是一份文档；`budget/2` 在 1M 模型上要 40 万 token，任何网关都有权直接拒。
+- `context-budget.ts` 新增 `repairToolPairing()`，并接到**四个**头部丢弃的出口（`dropOldest`、`hardTruncate`、`injectSummary`、`compactWithSummary`）。工具调用的配对关系是上游的硬约束，从前面切必然切坏，所以不是「可能有问题」而是「每次都可能有问题」。`tool` 消息只在前面有 assistant 声明过它的 `tool_call_id` 时才留下；assistant 的 `tool_calls` 收窄到真有回复的那些；一个只为调工具而存在的 assistant 轮次在所有调用都没回复时整条丢掉（留着它一样过不了校验）。pinned 的 system / developer 永不丢，幸存者保持原顺序。
+- 11148 的处理与 11115 分开：`tool_pairing` 先只做配对修复，修完仍然超预算才截断。一个格式错的 prompt 不需要更小，需要更合法——先砍一半上下文纯属浪费，而且摘要请求根本碰不到上游真正反对的那件事。
+- 新增 3 个测试文件（46 条用例）：窗口解析的优先级与对象形态、`repairToolPairing` 的各种残破形状、以及恢复路径上「11115 归 context_overflow 而不是 client」「11148 只修复不砍半」这两条底线。
+### 渠道卡：上下文窗口永远显示 200K，1M 那一档点不中
+> 一个 `??` 的缺省值写错了语义：pack 不发 `contextBudget` 的意思是「没有收窄」，客户端却把它当成「收窄到 200K」显示。
+#### 现象
+扫码渠道（Qoder 等）的模型行里，上下文窗口那颗「1M」的单选永远点不亮；点它一下界面闪一下又弹回 200K，看起来像保存失败，其实保存成功了。
+#### 根因：缺键语义被读反了
+pack 的 `contextBudgets` 里**缺键 = 不收窄 = 用模型原生窗口**（`model.list` 因此只在真的收窄过时才下发 `nativeContextWindow` 与 `contextBudget`）。而 `ChannelPoolSection` 里那一行是
+
+```ts
+const budget = model.contextBudget ?? (capped ? CONTEXT_BUDGET_DEFAULT : native)
+```
+
+模型原生 1M、没设过预算时，`capped` 为真、`contextBudget` 为 undefined，于是 `budget` 被算成 200000 —— 于是「200K」那颗 `checked` 恒真、「1M」那颗 `checked={budget === native}` 恒假。点 1M 走的是「清 cap」分支（写 `undefined`），而本来就没有键可清，重新载入后又算回 200000。
+
+同一个语义在区域卡（`PoolCard`）里是对的（`draft.budget ?? native`），两页因此行为不一致——但两页的数据源本来就不同：区域卡走宿主 `web-status` 的 `toWebModel`（恒带 `nativeContextWindow`），渠道卡走 pack RPC（只在收窄过时才带），所以区域卡的正确写法没能在渠道卡上复现这个 bug。
+#### 修法
+- 把这段判定抽成纯函数 `contextWindowChoice(model, defaultBudget)`（`model-facts.ts`），三行：`native = nativeContextWindow ?? contextWindow`、`capped = native > defaultBudget`、`budget = contextBudget ?? native`。抽出来的理由很实际：仓库里没有 jsdom / react-testing-library，UI 逻辑只有变成纯函数才测得到。
+- `ChannelPoolSection` 改为调用它；「1M」那颗 radio 的 `onChange` 仍然写 `undefined`（清 cap），不改成写 native 数字——pack 只在真收窄时才认 `nativeContextWindow`，写数字会把「用满原生窗口」这件事存成一个 cap。
+- 顺手删掉 `MODEL_CONTEXT_CAP = 131_072` 与它带来的 `facts.capped` 提示。那条注释说「这是 account-pool 车道实际对外宣告的窗口」，可现在的代码里没有任何一处按 131K 封顶（`catalog.visible()` 只按 `contextBudgets` 收窄，适配器与 `web-status` 都是原样透传），于是 1M 的模型在 facts 行里被印成 131K，还附一句「本池按 131K 提供」——纯属误导。`modelFigureLine` 现在只印模型公布的数字，不再做任何推断。
+### 账号池：补「重测限流」与「清除标记」
+> 「测试连接」永远是通的，所以它永远解释不了「可用账号均在限流中」——两个开关，不是一回事。
+#### 现象
+Qoder 两个账号在界面上显示「模型 dfmodel 的可用账号均在限流中，最近一个将于 … 解禁」，可点「测试连接」立刻返回成功。用户据此判断「账号没问题」，而限流标记纹丝不动。
+#### 根因：`account.test` 按设计不落盘
+pack 的 `account.test` 只发一次真实探活并如实回报结果，**不清标记、不写回新的重置时刻**（`pack.js` 里对这条有明文注释）。清标记的是另一个方法 `account.retest`（探那些带标记的模型，能回话才清）和 `account.reset`（直接删，不发请求）。客户端此前只接了 `account.test`，另外两个方法连白名单里都没有。
+#### 修法
+- `channel-rpc.ts` 新增 `retestResultFrom()` / `resetResultFrom()` 与两个结果类型，把 pack 的原始回包收成明确形状（`tested` / `cleared` / `stillLimited` / `error`，`clearedCount` / `accountCount`），非字符串与非对象行逐条丢弃而不是让它们变成 `undefined` 混进列表。
+- `ChannelPoolSection` 的 `accountAction` 扩两个动作，并在每个账号行上补「重测限流」「清除标记」两个按钮；提示文案由 `retestNotice()` / `resetNotice()` 两个纯函数生成，四个分支各自可读：没标记（`tested === 0`，一次请求都没发，这是**答案**不是失败）、全清掉、仍受限（把厂商原文带出来）、被拒绝。
+- `status-paths.ts` 的 `CHANNEL_PACK_METHODS` 白名单补 `account.retest` / `account.reset`。白名单是文档不是闸门（`callPack` 不查它），但漏登记会让后来的人以为这两个方法不可用。
+- 新增 `tests/channel-retest.test.ts`（16 条用例）：`tested === 0` 不许被写成失败、`stillLimited` 必须保留厂商原文、`cleared` 必须过滤非字符串、拒绝与未知形状返回 `undefined` 而不是空结果、reset 缺字段退 0 而不是 `NaN`。
+
 ## 2.4.0 — 每个账号一个出口 IP，Qoder 账号环境隔离
 > 这一版收掉两件同源的事：池里的账号在上游看来不再共享同一个来源 —— 出口 IP 可以逐账号配，Qoder 的机器身份也逐账号独立。前者的底线是「宁可失败也不回退直连」，后者撞上的是 Qoder 服务端 6 个机器身份槽位的物理上限。
 ### 每个账号一个出口 IP
