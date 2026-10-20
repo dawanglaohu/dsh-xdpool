@@ -83,6 +83,10 @@ Then it grew into seven pages. Beyond the account pool: sign in to thirteen vend
 
 - **CN / global auto-detection**: the upstream origin is picked per account from its login domain — a global sign-in (`workbuddy.ai`) goes to `www.workbuddy.ai`, CN (the default) to `copilot.tencent.com`. Both kinds can live in the same pool.
 
+- **A dedicated egress IP per account**: give one account an ordered proxy chain — index 0 is its primary exit and the rest step in behind it. No chain means direct, exactly as before.
+
+- **A dead proxy never falls back to direct**: if every hop fails the request fails, rather than quietly leaving from your own address. Silent fallback is the ban scenario.
+
 - **Manual controls when you want them**: re-detect accounts, clear all cooldowns, and daily check-in — on the card and in the CLI.
 
 ### 2. Points automation
@@ -155,7 +159,7 @@ dsh plugin --profile desktop add github:dawanglaohu/dsh-xdpool
 ```sh
 pnpm install
 pnpm build              # produces lib/index.js + lib/index.d.ts + lib/bin.js + lib/client.js
-pnpm test               # 138 tests
+pnpm test               # 967 tests
 pnpm typecheck          # host side
 pnpm typecheck:client   # client side
 ```
@@ -246,6 +250,45 @@ xdpool:
   cooldownMs: 120000
 ```
 
+### A dedicated egress proxy per account
+
+Any single account in the pool can be pinned to its own outbound address. **This is routing state, not a `settings.xdpool` field** — it is deliberately absent from the table above and from `settings.yaml`.
+
+**Where it lives**: `~/.dsh/.xdpool/proxies.json` (overridable via `DSH_HOME`), shaped as "account id → ordered proxy array":
+
+```json
+{
+  "version": 1,
+  "accounts": {
+    "0123456789abcdef": [
+      "http://user:pass@1.2.3.4:8080",
+      "socks5h://user:pass@5.6.7.8:1080"
+    ]
+  }
+}
+```
+
+**The array is an ordered fallback list, not a set**: index 0 is the primary egress and the rest are tried in turn only when it fails. **An absent key means direct**; an empty array is the same thing spelled differently, so an empty chain is never written to the file. The file is hand-editable and read tolerantly: non-strings, empty strings, duplicates and entries that do not parse are dropped one by one — a single bad line must not cost you every proxy you configured. A wholly broken document degrades to "everyone direct" and the pool still starts. Writes go through temp-file-plus-rename, so a half-written file never appears.
+
+**A dead proxy never falls back to direct**: when every hop fails the request fails (`every proxy failed: <redacted proxy> connect <reason>`) instead of silently leaving from your own address. The next hop is only tried while the response head has not arrived; once it has, nothing is retried, because a retry would replay an answer that has already started streaming. Request bodies are replayed across hops only when they are strings — a streaming body goes to the first hop only.
+
+**Schemes**: `http:`, `https:`, `socks5:`, `socks5h:`. Both SOCKS variants hand the **hostname** to the proxy (ATYP=0x03) and do no local DNS, so a DNS leak cannot expose your real egress upstream. The connect timeout defaults to 8 seconds and covers dial + handshake + waiting for the response head; it stops once the head arrives, so a body may legitimately stream for minutes.
+
+**Circuit breaker**: three consecutive failures on one hop open it for 60 seconds, during which it is skipped without spending any connect-timeout budget. State is keyed by the raw proxy URL, so two accounts sharing a proxy share the verdict.
+
+**Passwords only ever reach the card as `****`**. Saving that string back resolves the real password by matching protocol + host + port + username — so editing the port without retyping the password does not flatten it to four asterisks.
+
+**Filling it in on the card**: each account row in the pool ends with a multi-line box and a badge (`Direct` or `Proxy xN`).
+
+1. One proxy URL per line, **the top line first**; several lines make a fallback chain.
+2. Hit "Save", or press `Ctrl/Cmd+Enter` (a plain Enter is still a newline). Saving never dials — a save has to succeed precisely while the proxy is down, which is when you are fixing it.
+3. "Test" probes each hop separately and reports `{latency}ms · via {egress IP}` or the failure reason per entry. It is slow by design (a dead hop costs a whole connect timeout), which is why it is separate from saving: only a per-hop probe can answer "which link is dead".
+4. Clearing the box and saving puts that account back on direct (the badge returns to `Direct`).
+
+An account's health badge only reflects whether a chain exists; the last probe verdict is not persisted — otherwise the card would keep showing a failure long after the proxy was fixed. The live answer belongs to the test button.
+
+> Aggregate providers you configure yourself in `src/aggregate.ts` stay direct: those are third-party services you set up, not WorkBuddy accounts in the pool.
+
 ## Architecture
 
 - **Host side** (`src/`, inside the DSH main process)
@@ -255,6 +298,8 @@ xdpool:
   - `task-events.ts` — builds the 13 task event chains. Each chain is plain data plus the fingerprint channel it must go out on (desktop or web); the tasks that need a REAL conversation (skill, experts) open one here to get the server-side id.
   - `catalog.ts` / `upstream.ts` — the upstream client: model catalog (with per-model multipliers and free / image tags), credits, check-in, and every automation endpoint, switching CN/global by credential domain.
   - `web-status.ts` / `status-paths.ts` — the same-origin status document and routes the card reads. Mutations are gated on POST + loopback origin + an explicit `accountId`.
+  - `proxy-fetch.ts` — the outbound proxy transport: HTTP CONNECT / SOCKS5 tunnels, the ordered fallback chain, the circuit breaker, failure classification and credential redaction.
+  - `proxy-store.ts` — reads, normalises and atomically rewrites `proxies.json` (tolerant parsing, empty chains never written).
   - `bin.ts` — the CLI above.
 - **Client** (`src/client/`, the browser card loaded via `dsh.client`)
   The collapsible shell reuses the host's `dsm-plugin-card*` style language (`--dsw-alias-*` theme tokens); content classes are namespaced `dsm-xdpool-*`, and copy lives under the `settings.xdpool` namespace.
@@ -264,6 +309,8 @@ xdpool:
 ## Known limitations
 
 - **The WorkBuddy sign-in itself still goes through the desktop app**: XD Pool can launch QR sign-in for its own thirteen login channels, but WorkBuddy's own token is minted by the desktop app's Tencent SSO and bound to the device — the pool will not sign you in to WorkBuddy. Adding an account = signing in on the desktop app; XD Pool absorbs it.
+
+- **Proxies are per account, not global**: there is no "route the whole machine through a proxy" switch — a global proxy would put every pooled account back on one IP, which is the exact thing this feature exists to avoid.
 
 - **A few automation tasks are deliberately not implemented**
   - `Expert_Philanthropy` (charity expert): requires a real donation; there is no way around it.

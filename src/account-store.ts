@@ -26,10 +26,15 @@ export const ACCOUNTS_FILE_NAME = 'accounts.json'
  *
  * The snapshot importer (`dsh-xdpool import <key>`) writes `<md5prefix>.json`
  * into this directory, and the pool scans it — so every other `.json` file here
- * is treated as an imported snapshot. These three are the plugin's own
+ * is treated as an imported snapshot. These four are the plugin's own
  * bookkeeping and must never be parsed as credentials.
+ *
+ * `proxies.json` belongs here for a second reason as well: the bindings are the
+ * plugin's own routing state, not a snapshot of an account, so exporting or
+ * importing them as credentials would carry one machine's network layout onto
+ * another — where the proxies do not exist and every bound account fails.
  */
-export const NON_SNAPSHOT_FILES = [ACCOUNTS_FILE_NAME, 'ignored.json', 'preferred.json'] as const
+export const NON_SNAPSHOT_FILES = [ACCOUNTS_FILE_NAME, 'ignored.json', 'preferred.json', 'proxies.json'] as const
 
 /** One durably stored account: identity plus the credential that worked. */
 export interface StoredAccount {
