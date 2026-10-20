@@ -37157,6 +37157,7 @@ function buildQoderCredential(payload, extra) {
     ...payload.expiresAt === void 0 ? {} : { expire_time: payload.expiresAt },
     ...payload.refreshTokenExpiresAt === void 0 ? {} : { refresh_token_expire_time: payload.refreshTokenExpiresAt },
     machine_id: extra.machineId,
+    ...extra.machineSlot === void 0 ? {} : { machine_slot: extra.machineSlot },
     ...payload.uid === void 0 ? {} : { uid: payload.uid },
     ...nickname === void 0 || nickname.length === 0 ? {} : { nickname }
   };
@@ -37185,6 +37186,7 @@ function qoderBearerToken(credential) {
 function applyQoderRefresh(credential, payload) {
   const next = buildQoderCredential(payload, {
     machineId: credential.machine_id,
+    ...credential.machine_slot === void 0 ? {} : { machineSlot: credential.machine_slot },
     ...credential.nickname === void 0 ? {} : { nickname: credential.nickname }
   });
   if (next.refresh_token === void 0 && credential.refresh_token !== void 0) {
@@ -45050,7 +45052,9 @@ async function defaultOpenBrowser3(url) {
   openBrowser2(url);
 }
 async function startQoderLoginFlow(options) {
-  const session = createQoderDeviceSession();
+  const machineSlot = options.machineSlot;
+  const slotForLogin = machineSlot !== void 0 ? machineSlot : qoderMachineSlotFromEnv();
+  const session = createQoderDeviceSession(options.machineId);
   const loginUrl = buildQoderAuthUrl(session, options.product);
   const controller = new AbortController();
   const signal = options.signal === void 0 ? controller.signal : AbortSignal.any([controller.signal, options.signal]);
@@ -45059,7 +45063,10 @@ async function startQoderLoginFlow(options) {
     if (payload.accessToken.length === 0) {
       throw new Error("\u767B\u5F55\u54CD\u5E94\u7F3A\u5C11\u8BBF\u95EE\u4EE4\u724C");
     }
-    const credential = buildQoderCredential(payload, { machineId: session.machineId });
+    const credential = buildQoderCredential(payload, {
+      machineId: session.machineId,
+      ...slotForLogin === void 0 ? {} : { machineSlot: slotForLogin }
+    });
     return toLoginFlowResult2(credential, loginUrl, session.machineId);
   })();
   result.catch(() => {
@@ -45167,6 +45174,12 @@ var QoderAuth = class extends Service4 {
    * 调用方拿到 `loginUrl` 后应当**立即** `window.open`，再 await `result`。
    */
   async startLogin(flowOptions = {}) {
+    if (flowOptions.machineSlot === void 0 && flowOptions.pool !== void 0) {
+      const used = await collectQoderUsedMachineSlots(flowOptions.pool, this.ctx, QODER_MACHINE_SLOT_PRODUCT_IDS);
+      const slot = await allocateQoderMachineSlotAsync(void 0, used);
+      if (slot === void 0) throw qoderMachineSlotExhaustedError();
+      flowOptions = { ...flowOptions, machineSlot: slot };
+    }
     this.active = true;
     const started = await startQoderLoginFlow({
       product: this.product,
@@ -45191,6 +45204,16 @@ var QoderAuth = class extends Service4 {
     this.lastRefreshError = void 0;
     this.scheduleRefresh();
     const credential = parseCredential4(flow.access);
+    if (flowOptions.machineSlot !== void 0 && flowOptions.pool !== void 0 && credential !== void 0) {
+      const used = await collectQoderUsedMachineSlots(flowOptions.pool, this.ctx, QODER_MACHINE_SLOT_PRODUCT_IDS);
+      used.delete(qoderCredentialMachineSlot(credential));
+      const settled = await ensureQoderMachineSlotAsync(credential, this.product, used, this.ctx.logger);
+      const settledSlot = qoderCredentialMachineSlot(settled);
+      if (settledSlot !== void 0 && settledSlot !== qoderCredentialMachineSlot(credential)) {
+        flow.access = JSON.stringify(settled);
+        await this.ctx.credentials.set(ref, flow.access);
+      }
+    }
     if (flowOptions.accountId !== void 0 && flowOptions.pool !== void 0) {
       await flowOptions.pool.addAccount({
         id: flowOptions.accountId,
@@ -56589,10 +56612,10 @@ function quotaRejectionHint(text) {
 // vendor/channel-pack/src/qoder-machine.ts
 import { execFileSync, spawn as spawn3 } from "node:child_process";
 import { existsSync as existsSync6, readFileSync as readFileSync6, readdirSync } from "node:fs";
-import { homedir as homedir3 } from "node:os";
+import { homedir as homedir3, hostname as hostname3 } from "node:os";
 import { join as join5 } from "node:path";
 var RUNTIME_INFO_TIMEOUT_MS = 2e4;
-var cached2;
+var identityCache = /* @__PURE__ */ new Map();
 function candidatePaths() {
   const override = process.env.QODER_MACHINE_TOKEN_PATH;
   if (override !== void 0 && override.length > 0) return [override];
@@ -56631,21 +56654,22 @@ function parseFile(path2) {
   if (typeof type !== "string" || type.length === 0) return void 0;
   return { token, type };
 }
-async function resolveQoderMachineIdentityAsync(forceExecutable) {
-  if (cached2 !== void 0) return cached2 ?? void 0;
-  const live = await readFromRuntimeInfoAsync(forceExecutable);
+async function resolveQoderMachineIdentityAsync(forceExecutable, slot) {
+  const key = normalizeQoderMachineSlot(slot);
+  if (identityCache.has(key)) return identityCache.get(key) ?? void 0;
+  const live = await readFromRuntimeInfoAsync(forceExecutable, key);
   if (live !== void 0) {
-    cached2 = live;
+    identityCache.set(key, live);
     return live;
   }
   for (const path2 of candidatePaths()) {
     const identity = parseFile(path2);
     if (identity !== void 0) {
-      cached2 = identity;
+      identityCache.set(key, identity);
       return identity;
     }
   }
-  cached2 = null;
+  identityCache.set(key, null);
   return void 0;
 }
 var QODER_DATA_DIR_NAMES = [".qoder", ".qoder-cn"];
@@ -56675,8 +56699,8 @@ function locateRuntimeInfo(override) {
   return findRuntimeInfoExecutable(homedir3());
 }
 var RUNTIME_INFO_ENVIRONMENT = "3";
-function runtimeInfoArgs() {
-  return [RUNTIME_INFO_ENVIRONMENT, "--account-stdin"];
+function runtimeInfoArgs(slot) {
+  return [slot ?? RUNTIME_INFO_ENVIRONMENT, "--account-stdin"];
 }
 function parseRuntimeInfoOutput(out) {
   const start = out.indexOf("{");
@@ -56693,9 +56717,14 @@ function parseRuntimeInfoOutput(out) {
   const type = record.machineType;
   if (typeof token !== "string" || token.length === 0) return void 0;
   if (typeof type !== "string" || type.length === 0) return void 0;
-  return { token, type };
+  // machineCode 是 runtime-info 三件套的第三项，官方桌面端每个请求都带
+  // `Cosy-MachineCode`。这里早先只取 token/type 把 code 丢了，请求头因此
+  // 永远缺一项。缺它不影响活动判定（实测四种头组合结果一致），但设备指纹
+  // 不完整，属于"看起来不像官方客户端"的短板。
+  const code = typeof record.machineCode === "string" && record.machineCode.length > 0 ? record.machineCode : void 0;
+  return { token, type, code };
 }
-async function readFromRuntimeInfoAsync(override) {
+async function readFromRuntimeInfoAsync(override, slot) {
   const exe = locateRuntimeInfo(override);
   if (exe === void 0) return void 0;
   return await new Promise((resolve2) => {
@@ -56707,7 +56736,7 @@ async function readFromRuntimeInfoAsync(override) {
     };
     let child;
     try {
-      child = spawn3(exe, [...runtimeInfoArgs()], { windowsHide: true });
+      child = spawn3(exe, [...runtimeInfoArgs(slot)], { windowsHide: true });
     } catch {
       done(void 0);
       return;
@@ -56739,17 +56768,48 @@ async function readFromRuntimeInfoAsync(override) {
     child.stdin?.end(JSON.stringify({ account: "" }));
   });
 }
-async function withQoderMachineHeadersAsync(headers, forceExecutable) {
-  const identity = await resolveQoderMachineIdentityAsync(forceExecutable);
+async function withQoderMachineHeadersAsync(headers, forceExecutable, slot) {
+  const identity = await resolveQoderMachineIdentityAsync(forceExecutable, slot);
   if (identity === void 0) return headers;
-  return {
+  const out = {
     ...headers,
     "Cosy-MachineToken": identity.token,
     "Cosy-MachineType": identity.type
   };
+  // 三件套缺一不可：官方桌面端同时发 Token/Type/Code，服务端按整套取设备指纹。
+  if (identity.code !== void 0) out["Cosy-MachineCode"] = identity.code;
+  return out;
+}
+/**
+ * 只按凭据自带的槽位注入机器身份。
+ *
+ * 凭据没有 machine_slot 时**不注入**任何机器头：缺头部时服务端按「无机器身份」
+ * 处理，比冒用默认槽位（等于冒用别人的机器身份）安全 —— 后者会让两个账号在
+ * 服务端看起来是同一台设备，活动只发给其中一个。
+ */
+async function withQoderCredentialMachineHeadersAsync(headers, credential, forceExecutable) {
+  const slot = qoderCredentialMachineSlot(credential);
+  if (slot === void 0) return headers;
+  return await withQoderMachineHeadersAsync(headers, forceExecutable, slot);
 }
 
 // vendor/channel-pack/src/qoder-credits.ts
+// 官方桌面客户端版本号（Qoder.exe 的 FileVersion；main.log 里 Cosy-Version 实测 0.4.8）。
+// ⚠️ 与 `COSY_VERSION`（加密推理通道的 CLI 版本 1.1.49）是两条独立通道：
+// 活动 / usage 接口走桌面端分支，用 CLI 版本号会露出非桌面指纹。
+var QODER_DESKTOP_VERSION = "0.4.8";
+function qoderDesktopMachineOs() {
+  const platform = process.platform;
+  return typeof platform === "string" ? platform : "";
+}
+function qoderDesktopMachineHostname() {
+  try {
+    const value = hostname3();
+    return typeof value === "string" ? value : "";
+  } catch {
+    return "";
+  }
+}
 var QODER_USAGE_PATH = "/sash/api/v2/me/usage";
 var QODER_CAMPAIGNS_PATH = "/sash/api/v1/me/campaigns";
 var QODER_CAMPAIGN_REFRESH_HOUR_UTC8 = 10;
@@ -56758,6 +56818,77 @@ function hasQoderCampaignRefreshedToday(nowMs = Date.now()) {
   return utc8.getUTCHours() >= QODER_CAMPAIGN_REFRESH_HOUR_UTC8;
 }
 var QODER_CREDITS_TIMEOUT_MS = 15e3;
+/**
+ * 单次请求的尝试上限（含首发）。
+ *
+ * Qoder 侧 429 / 5xx 都是瞬时状态，两次退避足以跨过去；再多只会把
+ * 「服务端确实挂了」拖成半分钟的静默等待。
+ */
+var QODER_RETRY_MAX_ATTEMPTS = 3;
+/** 退避基数：第 n 次重试等 `base * 2^(n-1)`，另加抖动打散多账号的节奏。 */
+var QODER_RETRY_BASE_MS = 600;
+var QODER_RETRY_MAX_DELAY_MS = 8e3;
+/**
+ * 批量操作里账号之间的最小间隔。
+ *
+ * 活动 / 用量 / 领取三类请求都是**按账号**发的，同一秒内成串抵达是脚本最容易
+ * 留下的指纹，而官方桌面客户端一个人一个账号，天然不会出现这种节奏。
+ */
+var QODER_ACCOUNT_PACE_MS = 1200;
+var QODER_ACCOUNT_PACE_JITTER_MS = 600;
+function qoderSleep(ms) {
+  return new Promise((resolve2) => {
+    setTimeout(resolve2, ms).unref?.();
+  });
+}
+function qoderPaceDelayMs() {
+  return QODER_ACCOUNT_PACE_MS + Math.floor(Math.random() * QODER_ACCOUNT_PACE_JITTER_MS);
+}
+function isQoderRetryableStatus(status) {
+  return status === 429 || status === 408 || status >= 500;
+}
+function qoderRetryAfterMs(headers) {
+  if (headers === void 0 || headers === null || typeof headers.get !== "function") return void 0;
+  const raw = headers.get("retry-after");
+  if (raw === void 0 || raw === null || raw === "") return void 0;
+  const seconds = Number(raw);
+  if (Number.isFinite(seconds)) return seconds >= 0 ? Math.ceil(seconds * 1e3) : void 0;
+  const at = Date.parse(raw);
+  return Number.isFinite(at) ? Math.max(0, at - Date.now()) : void 0;
+}
+function qoderRetryDelayMs(attempt, retryAfterMs) {
+  if (retryAfterMs !== void 0) return Math.min(retryAfterMs, QODER_RETRY_MAX_DELAY_MS);
+  const backoff = QODER_RETRY_BASE_MS * Math.pow(2, attempt - 1);
+  return Math.min(backoff, QODER_RETRY_MAX_DELAY_MS) + Math.floor(Math.random() * 250);
+}
+/**
+ * 发一次 Qoder 请求，对 **瞬时** 失败做有限退避重试。
+ *
+ * 只重试 429 / 408 / 5xx 与网络抖动：400（字段校验）、401/403（凭据失效）、
+ * 404（路径错）重试多少次都是同一个答案，退避只会把错误延迟几秒再抛给用户。
+ * 429 带 `Retry-After` 时按服务端给的节奏等，不自己猜 —— 猜短了会连续撞墙，
+ * 猜长了会把一次秒级重试拖成无谓等待。
+ */
+async function qoderFetchWithRetry(url, init, fetcher) {
+  let lastError;
+  for (let attempt = 1; attempt <= QODER_RETRY_MAX_ATTEMPTS; attempt++) {
+    let response;
+    try {
+      response = await fetcher(url, init);
+    } catch (error) {
+      lastError = error;
+      if (attempt >= QODER_RETRY_MAX_ATTEMPTS) throw error;
+      await qoderSleep(qoderRetryDelayMs(attempt));
+      continue;
+    }
+    if (attempt < QODER_RETRY_MAX_ATTEMPTS && isQoderRetryableStatus(response.status)) {
+      await qoderSleep(qoderRetryDelayMs(attempt, qoderRetryAfterMs(response.headers)));
+      continue;
+    }
+    return response;
+  }
+  throw lastError ?? new Error("qoder: request retries exhausted");
+}
 var NOT_ACTIVATED_HINT = "\u8BE5\u8D26\u53F7\u5C1A\u672A\u5728 Qoder \u4FA7\u5F00\u901A\u6BCF\u65E5\u9886\u53D6\uFF08\u6BCF\u65E5 100 Credits\uFF09\u3002\u8BF7\u5148\u7528 Qoder \u5B98\u65B9\u5BA2\u6237\u7AEF\u767B\u5F55\u4E00\u6B21\u8BE5\u8D26\u53F7\uFF0C\u5F00\u901A\u540E\u518D\u56DE\u6765\u9886\u53D6\u3002";
 var NOT_REFRESHED_YET_HINT = `\u4ECA\u5929\u7684\u6BCF\u65E5\u6D3B\u52A8\u5C1A\u672A\u5237\u65B0\uFF08\u6BCF\u65E5 ${QODER_CAMPAIGN_REFRESH_HOUR_UTC8}:00\uFF08UTC+8\uFF09\u5237\u65B0\uFF09\uFF0C\u5F53\u524D\u770B\u5230\u7684\u662F\u6628\u5929\u90A3\u4E00\u8F6E\uFF0C\u8BF7\u7A0D\u540E\u518D\u6765\u9886\u53D6\u3002`;
 function isQoderNotActivated(campaigns, usageBody) {
@@ -56772,25 +56903,157 @@ function isQoderNotActivated(campaigns, usageBody) {
 }
 async function fetchQoderUsageRaw(credential, product, fetcher = fetch) {
   try {
-    const response = await fetcher(`${product.openApiBase}${QODER_USAGE_PATH}`, {
+    const response = await qoderFetchWithRetry(`${product.openApiBase}${QODER_USAGE_PATH}`, {
       method: "GET",
       headers: await creditsHeaders(credential, product),
       signal: AbortSignal.timeout(QODER_CREDITS_TIMEOUT_MS)
-    });
+    }, fetcher);
     if (!response.ok) return void 0;
     return await response.json();
   } catch {
     return void 0;
   }
 }
-async function creditsHeaders(credential, product) {
-  return await withQoderMachineHeadersAsync({
+/** runtime-info.exe 能稳定产出机器标识的 environment 槽位。 */
+var QODER_MACHINE_SLOT_PRODUCT_IDS = ["qoder", "qodercn"];
+var QODER_MACHINE_SLOT_CANDIDATES = ["0", "3", "4", "5", "6", "7"];
+function normalizeQoderMachineSlot(slot) {
+  if (typeof slot !== "string") return "3";
+  const trimmed = slot.trim();
+  return /^[0-9]{1,3}$/.test(trimmed) ? trimmed : "3";
+}
+function qoderMachineSlotFromEnv() {
+  const fromEnv = process.env.QODER_MACHINE_SLOT;
+  return fromEnv !== void 0 && fromEnv.length > 0 ? normalizeQoderMachineSlot(fromEnv) : void 0;
+}
+function qoderCredentialMachineSlot(credential) {
+  const slot = credential === void 0 || credential === null ? void 0 : credential.machine_slot;
+  return slot === void 0 ? void 0 : normalizeQoderMachineSlot(slot);
+}
+async function qoderSlotCanClaimAsync(credential, product, slot) {
+  let campaigns;
+  try {
+    campaigns = await loadCampaigns({ ...credential, machine_slot: slot }, product);
+  } catch {
+    return false;
+  }
+  if (campaigns === void 0 || !Array.isArray(campaigns.campaigns)) return false;
+  return campaigns.campaigns.some((campaign) => campaign.actionType === "CLAIM_BENEFIT");
+}
+/**
+ * 让一份凭据落在「服务端愿意给它发活动」的机器槽位上。
+ *
+ * 槽位是服务端判定活动资格的身份因子之一：同一个槽位被别的账号占用后，
+ * 新账号沿用该槽位就拿不到 CLAIM_BENEFIT（表现为「签到不可用」）。
+ * 登录当下就把新账号挪到空闲且可用的槽位上，避免等到下次重启迁移才生效。
+ *
+ * 候选槽位全被占用或全部不可用时**抛错**：静默回落到默认槽位会让两个账号
+ * 共用一份机器身份，服务端只认其中一个 —— 那种"看起来登录成功、其实拿不到积分"
+ * 的状态比直接失败更难排查，所以宁可让登录报错。
+ *
+ * @param usedSlots 已被其他账号占用的槽位（含 Qoder 全部产品）。
+ */
+async function ensureQoderMachineSlotAsync(credential, product, usedSlots, logger) {
+  const current = qoderCredentialMachineSlot(credential);
+  if (current !== void 0 && await qoderSlotCanClaimAsync(credential, product, current)) return credential;
+  for (const slot of QODER_MACHINE_SLOT_CANDIDATES) {
+    if (slot === current) continue;
+    if (usedSlots !== void 0 && usedSlots.has(slot)) continue;
+    if (!(await qoderSlotCanClaimAsync(credential, product, slot))) continue;
+    logger?.info?.("[channel-pack] Qoder account " + (credential.nickname ?? credential.uid ?? "?") + " machine slot -> " + slot);
+    return { ...credential, machine_slot: slot };
+  }
+  if (current !== void 0) return credential;
+  throw qoderMachineSlotExhaustedError();
+}
+
+async function collectQoderUsedMachineSlots(pool, ctx, productIds) {
+  const used = /* @__PURE__ */ new Set();
+  const list = Array.isArray(productIds) ? productIds : [productIds];
+  for (const provider of list) {
+    try {
+      const accounts = await pool.listAccounts(provider);
+      for (const entry of accounts) {
+        try {
+          const resolved = await ctx.credentials.resolve(credentialRef(entry.credentialRef));
+          if (resolved === void 0) continue;
+          const parsed = JSON.parse(resolved.value);
+          const slot = qoderCredentialMachineSlot(parsed);
+          if (slot !== void 0) used.add(slot);
+        } catch {
+        }
+      }
+    } catch {
+    }
+  }
+  return used;
+}
+async function probeQoderMachineSlots(forceExecutable, slots) {
+  const found = [];
+  for (const slot of slots) {
+    const identity = await resolveQoderMachineIdentityAsync(forceExecutable, slot);
+    if (identity !== void 0) found.push({ slot, token: identity.token, type: identity.type });
+  }
+  return found;
+}
+async function allocateQoderMachineSlotAsync(forceExecutable, usedSlots) {
+  for (let i = 0; i <= 7; i += 1) {
+    const slot = String(i);
+    if (usedSlots !== void 0 && usedSlots.has(slot)) continue;
+    const identity = await resolveQoderMachineIdentityAsync(forceExecutable, slot);
+    if (identity !== void 0) return slot;
+  }
+  return void 0;
+}
+function qoderMachineSlotExhaustedError() {
+  const error = new Error(
+    "Qoder 的机器身份槽位已用尽（" + QODER_MACHINE_SLOT_CANDIDATES.length + " 个）。" +
+    "继续登录会让新账号复用别的账号的机器身份，服务端不再给它下发每日领取活动。" +
+    "请先删除一个已不需要的 Qoder 账号再登录新账号。"
+  );
+  error.code = "qoder-machine-slot-exhausted";
+  return error;
+}
+/**
+ * 为一个**新登录**的 Qoder 账号分配独立的机器槽位。
+ *
+ * 与 {@link allocateQoderMachineSlotAsync} 的区别：后者只保证「该槽位能产出机器标识」，
+ * 本函数还要求「服务端愿意给这个账号发活动」，并且**槽位用尽时抛错**而不是回落到
+ * 硬编码的默认槽位 —— 静默回落正是「后登录的账号拿不到积分」这个缺陷的成因。
+ *
+ * @param usedSlots 已被其他账号占用的槽位；调用方必须包含 Qoder 全部产品。
+ */
+async function reserveQoderMachineSlotAsync(credential, product, usedSlots, logger) {
+  for (const slot of QODER_MACHINE_SLOT_CANDIDATES) {
+    if (usedSlots !== void 0 && usedSlots.has(slot)) continue;
+    if (!(await qoderSlotCanClaimAsync(credential, product, slot))) continue;
+    logger?.info?.("[channel-pack] Qoder account " + (credential.nickname ?? credential.uid ?? "?") + " machine slot -> " + slot);
+    return slot;
+  }
+  throw qoderMachineSlotExhaustedError();
+}
+async function creditsHeaders(credential, product, forceExecutable) {
+  const headers = {
     Accept: "application/json",
     Authorization: `Bearer ${qoderBearerToken(credential)}`,
     // 桌面 app 身份（`'10'`）；服务端据此进入活动下发分支。
     "Cosy-ClientType": product.sashClientType,
+    // 桌面端版本号：官方 0.4.8 每个请求都带（见 QODER_DESKTOP_VERSION 注释）。
+    "Cosy-Version": QODER_DESKTOP_VERSION,
     "User-Agent": "Qoder"
-  });
+  };
+  // 设备维度头。系统名 / 主机名拿不到时宁可不发，也别发字符串 "undefined"
+  //（undici 会把 undefined 头值序列化成 "undefined"，那比缺头更假）。
+  const machineOs = qoderDesktopMachineOs();
+  if (machineOs.length > 0) headers["Cosy-MachineOS"] = machineOs;
+  const machineHost = qoderDesktopMachineHostname();
+  if (machineHost.length > 0) headers["Cosy-MachineHostname"] = machineHost;
+  // 凭据自带的 machine_id：每账号一个 UUID。它与 runtime-info 槽位派生的
+  // `Cosy-MachineToken` 是两套东西，别混用（后者才是活动判定因子）。
+  if (typeof credential.machine_id === "string" && credential.machine_id.length > 0) {
+    headers["Cosy-MachineId"] = credential.machine_id;
+  }
+  return await withQoderCredentialMachineHeadersAsync(headers, credential, forceExecutable);
 }
 function readNumber4(source, key) {
   if (typeof source !== "object" || source === null) return void 0;
@@ -56833,11 +57096,11 @@ function toPackage(name2, quota, options = {}) {
 async function fetchQoderCreditBalance(credential, product, fetcher = fetch) {
   let response;
   try {
-    response = await fetcher(`${product.openApiBase}${QODER_USAGE_PATH}`, {
+    response = await qoderFetchWithRetry(`${product.openApiBase}${QODER_USAGE_PATH}`, {
       method: "GET",
       headers: await creditsHeaders(credential, product),
       signal: AbortSignal.timeout(QODER_CREDITS_TIMEOUT_MS)
-    });
+    }, fetcher);
   } catch {
     return null;
   }
@@ -56901,14 +57164,14 @@ function benefitAmount(item) {
   if (typeof item !== "object" || item === null) return void 0;
   return readNumber4(item.benefit, "amount");
 }
-async function loadCampaigns(credential, product, fetcher) {
+async function loadCampaigns(credential, product, fetcher = fetch) {
   let response;
   try {
-    response = await fetcher(`${product.openApiBase}${QODER_CAMPAIGNS_PATH}`, {
+    response = await qoderFetchWithRetry(`${product.openApiBase}${QODER_CAMPAIGNS_PATH}`, {
       method: "GET",
       headers: await creditsHeaders(credential, product),
       signal: AbortSignal.timeout(QODER_CREDITS_TIMEOUT_MS)
-    });
+    }, fetcher);
   } catch {
     return void 0;
   }
@@ -56939,12 +57202,12 @@ async function claimQoderCampaign(credential, product, campaignId, fetcher = fet
   const url = `${product.openApiBase}${QODER_CAMPAIGNS_PATH}/${encodeURIComponent(campaignId)}/claim`;
   let response;
   try {
-    response = await fetcher(url, {
+    response = await qoderFetchWithRetry(url, {
       method: "POST",
       headers: { ...await creditsHeaders(credential, product), "Content-Type": "application/json" },
       body: "",
       signal: AbortSignal.timeout(QODER_CREDITS_TIMEOUT_MS)
-    });
+    }, fetcher);
   } catch (error) {
     return { kind: "failed", code: -1, message: error instanceof Error ? error.message : String(error) };
   }
@@ -56967,10 +57230,62 @@ async function claimQoderCampaign(credential, product, campaignId, fetcher = fet
   }
   return { kind: "claimed", credit: result.amount ?? 0, streakDays: 0, isStreakDay: false };
 }
+function qoderErrorFields(text) {
+  if (typeof text !== "string" || text.length === 0) return void 0;
+  let body;
+  try {
+    body = JSON.parse(text);
+  } catch {
+    return void 0;
+  }
+  if (typeof body !== "object" || body === null) return void 0;
+  const record = body;
+  const code = typeof record.errorCode === "string" && record.errorCode.length > 0
+    ? record.errorCode
+    : typeof record.code === "string" && record.code.length > 0
+      ? record.code
+      : void 0;
+  const message = typeof record.errorMessage === "string" && record.errorMessage.length > 0
+    ? record.errorMessage
+    : typeof record.message === "string" && record.message.length > 0
+      ? record.message
+      : void 0;
+  const requestId = typeof record.requestId === "string" && record.requestId.length > 0 ? record.requestId : void 0;
+  if (code === void 0 && message === void 0) return void 0;
+  return { code, message, requestId };
+}
+/**
+ * 把 Qoder 的失败响应翻成一句能指导下一步动作的中文。
+ *
+ * 服务端的错误体是结构化的（`errorCode`/`errorMessage` 或 `code`/`message`），
+ * 直接截断原文会把这个结构当噪声丢掉，用户只看到半截英文。这里优先按语义
+ * 分支：凭据失效给出重登，活动过期/参数被拒给出「活动已结束」，其余保留
+ * 服务端原话与 requestId —— requestId 是唯一能拿去对账的线索。
+ */
 function describeNonJson(status, text) {
-  if (status === 401 || status === 403) return `\u51ED\u636E\u5DF2\u5931\u6548\uFF08HTTP ${status}\uFF09\uFF0C\u8BF7\u91CD\u65B0\u767B\u5F55\u8BE5\u8D26\u53F7`;
+  const detail = qoderErrorFields(text);
+  const suffix = detail?.requestId === void 0 ? "" : `（requestId ${detail.requestId}）`;
+  const serverSaid = detail?.message === void 0 ? "" : `：${detail.message}`;
+  if (status === 401 || status === 403) {
+    if (detail?.code === "TOKEN_EXPIRE") {
+      return `凭据已失效（HTTP ${status}，TOKEN_EXPIRE），请重新登录该账号`;
+    }
+    return `凭据已失效（HTTP ${status}）${serverSaid}${suffix}，请重新登录该账号`;
+  }
+  if (status === 400 && detail?.code === "FIELD_VALIDATION_FAILED") {
+    return `服务端拒绝了领取请求（活动可能已过期或已下线）${suffix}`;
+  }
+  if (status === 404) {
+    return `活动领取接口不存在或活动已下线（HTTP 404）${suffix}`;
+  }
+  if (status === 429) {
+    return `请求过于频繁被服务端限流（HTTP 429）${serverSaid}${suffix}，请稍后重试`;
+  }
+  if (detail !== void 0) {
+    return `领取失败（HTTP ${status}，${detail.code ?? "未知错误"}）${serverSaid}${suffix}`;
+  }
   const snippet = text.trim().slice(0, 80).replace(/\s+/g, " ");
-  return `\u670D\u52A1\u7AEF\u8FD4\u56DE\u4E86\u975E JSON \u54CD\u5E94\uFF08HTTP ${status}\uFF09\uFF1A${snippet}`;
+  return `服务端返回了非 JSON 响应（HTTP ${status}）：${snippet}`;
 }
 async function claimQoderDailyCheckin(credential, product, fetcher = fetch, nowMs = Date.now()) {
   const parsed = await loadCampaigns(credential, product, fetcher);
@@ -60279,7 +60594,10 @@ async function collectClaimResults(accounts, product, deps) {
   const precheck = deps.precheckStatus !== false;
   const results = [];
   const outcomes = [];
+  const paceMs = deps.paceMs;
+  let seen = 0;
   for (const entry of accounts) {
+    if (seen++ > 0 && paceMs !== void 0) await qoderSleep(paceMs());
     let outcome;
     try {
       const resolved = await deps.resolve(credentialRef13(entry.credentialRef));
@@ -60499,6 +60817,120 @@ async function catalogFactsFor(modelAdapters, provider, catalog, contextBudgets)
   await Promise.all(Array.from({ length: width }, () => worker()));
   return facts;
 }
+/**
+ * 给没有 machine_slot 的旧凭据补上槽位，使各账号的机器身份互不重叠。
+ *
+ * 服务端按 (uid, 机器身份) 判定活动资格，两个账号共用一个槽位时，后登录的那个拿不到
+ * CLAIM_BENEFIT。旧凭据里没有槽位字段，实际跑的是硬编码的 "3"，所以第一轮先把 "3"
+ * 还给真正在它上面工作的账号，第二轮才给剩下的账号找空闲且真能领到积分的槽位。
+ *
+ * 槽位池由 Qoder **全部产品**共享（国际版与国内版共用同一份 runtime-info 机器身份），
+ * 因此这里先跨产品把已占槽位收集齐再分配，否则两边会各自从 "0" 开始、撞进同一个槽位。
+ *
+ * 已分配但当前领不到积分的账号也会被换到可用槽位，避免一次错误的分配永久卡住。
+ * 探不到可用槽位就不改动凭据 —— 宁可不修，也不把本来能用的账号改坏。
+ */
+async function migrateQoderMachineSlots(ctx, pool, qoderFamily) {
+  const LEGACY_SLOT = "3";
+  const members = qoderFamily.map((member) => ({
+    member,
+    pending: [],
+    assigned: []
+  }));
+  const taken = /* @__PURE__ */ new Set();
+  const rebuildTaken = () => {
+    taken.clear();
+    for (const group of members) {
+      for (const item of group.pending) {
+        const slot = qoderCredentialMachineSlot(item.credential);
+        if (slot !== void 0) taken.add(slot);
+      }
+      for (const item of group.assigned) {
+        const slot = qoderCredentialMachineSlot(item.credential);
+        if (slot !== void 0) taken.add(slot);
+      }
+    }
+  };
+  for (const group of members) {
+    let accounts;
+    try {
+      accounts = await pool.listAccounts(group.member.product.id);
+    } catch {
+      continue;
+    }
+    for (const entry of accounts) {
+      let credential;
+      try {
+        const resolved = await ctx.credentials.resolve(credentialRef(entry.credentialRef));
+        if (resolved === void 0) continue;
+        credential = JSON.parse(resolved.value);
+      } catch {
+        continue;
+      }
+      if (credential === null || typeof credential !== "object") continue;
+      const slot = qoderCredentialMachineSlot(credential);
+      if (slot === void 0) {
+        group.pending.push({ entry, credential, product: group.member.product });
+        continue;
+      }
+      taken.add(slot);
+      group.assigned.push({ entry, credential, slot, product: group.member.product });
+    }
+  }
+  const canClaim = async (credential, slot, product) => {
+    let campaigns;
+    try {
+      campaigns = await loadCampaigns({ ...credential, machine_slot: slot }, product);
+    } catch {
+      return false;
+    }
+    if (campaigns === void 0) return false;
+    const list = campaigns.campaigns;
+    if (!Array.isArray(list)) return false;
+    return list.some((campaign) => campaign.actionType === "CLAIM_BENEFIT");
+  };
+  const assign = async (item, slot) => {
+    item.credential = { ...item.credential, machine_slot: slot };
+    rebuildTaken();
+    try {
+      await ctx.credentials.set(
+        credentialRef(item.entry.credentialRef),
+        JSON.stringify(item.credential)
+      );
+      ctx.logger?.info?.("[channel-pack] Qoder account " + item.entry.id + " machine slot -> " + slot);
+    } catch {
+    }
+  };
+  for (const group of members) {
+    for (const item of group.pending) {
+      if (taken.has(LEGACY_SLOT)) continue;
+      if (!(await canClaim(item.credential, LEGACY_SLOT, item.product))) continue;
+      await assign(item, LEGACY_SLOT);
+    }
+  }
+  for (const group of members) {
+    for (const item of group.pending) {
+      if (qoderCredentialMachineSlot(item.credential) !== void 0) continue;
+      for (const slot of QODER_MACHINE_SLOT_CANDIDATES) {
+        if (taken.has(slot)) continue;
+        if (!(await canClaim(item.credential, slot, item.product))) continue;
+        await assign(item, slot);
+        break;
+      }
+    }
+  }
+  for (const group of members) {
+    for (const item of group.assigned) {
+      if (await canClaim(item.credential, item.slot, item.product)) continue;
+      for (const slot of QODER_MACHINE_SLOT_CANDIDATES) {
+        if (taken.has(slot)) continue;
+        if (!(await canClaim(item.credential, slot, item.product))) continue;
+        await assign(item, slot);
+        break;
+      }
+    }
+  }
+}
 function registerChannelPackEndpoints(ctx, pool, codearts, buddy, workbuddy, lobsterai, qoder, qoderCn, trae, cline, loomy, raccoon, minimax, zcode, gemini, modelAdapters, config = {}) {
   const connection = ctx.connection ?? ctx.get("connection");
   if (!connection || typeof connection.fetch?.register !== "function") {
@@ -60528,6 +60960,9 @@ function registerChannelPackEndpoints(ctx, pool, codearts, buddy, workbuddy, lob
     warn: (message2) => ctx.logger?.warn?.(message2)
   });
   autoCheckin.start();
+  void migrateQoderMachineSlots(ctx, pool, qoderFamily).catch((error) => {
+    ctx.logger?.warn?.('[channel-pack] Qoder machine-slot migration failed: ' + String(error));
+  });
   ctx.effect?.(() => () => autoCheckin.stop(), "channel-pack: auto checkin");
   const usageBadge = createUsageBadge({
     collectBalances: (provider) => handleMethod("credits.balances", { provider }),
@@ -60781,7 +61216,7 @@ function registerChannelPackEndpoints(ctx, pool, codearts, buddy, workbuddy, lob
           return { ok: true, value: { accountId: id, loginUrl: started.loginUrl } };
         } else if (isQoderFamily(provider)) {
           const { product: product2, auth } = requireQoderFamily(provider);
-          const started = await auth.startLogin({ refName });
+          const started = await auth.startLogin({ refName, pool });
           await pool.addAccount({
             id,
             provider: product2.id,
@@ -61518,6 +61953,18 @@ function registerChannelPackEndpoints(ctx, pool, codearts, buddy, workbuddy, lob
       // 只对**未知** provider 生效。
       case "credits.status": {
         const req = payload;
+        if (isQoderFamily(req.provider)) {
+          // Qoder 家族没有独立的「签到状态」接口：领取资格只体现在 campaigns 的
+          // claimStatus 上，由 credits.claimAll 自己判断。这里回 null 而不是走通用
+          // fetchCheckinStatus —— 那条路径会拿 Qoder 产品去请求它根本没有的签到端点。
+          const accounts2 = await pool.listAccounts(req.provider);
+          return {
+            ok: true,
+            value: {
+              accounts: accounts2.map((entry) => ({ accountId: entry.id, nickname: entry.nickname, status: null }))
+            }
+          };
+        }
         if (req.provider === "codearts") {
           const accounts2 = await pool.listAccounts(req.provider);
           return {
@@ -61597,6 +62044,7 @@ function registerChannelPackEndpoints(ctx, pool, codearts, buddy, workbuddy, lob
             resolve: (ref) => ctx.credentials.resolve(ref),
             claim: (credential) => claimQoderDailyCheckin(credential, product2),
             precheckStatus: false,
+            paceMs: qoderPaceDelayMs,
             warn: (msg) => ctx.logger?.warn?.(msg)
           });
           return { ok: true, value: value2 };
@@ -61802,7 +62250,9 @@ function registerChannelPackEndpoints(ctx, pool, codearts, buddy, workbuddy, lob
         if (isQoderFamily(req.provider)) {
           const { product: product2 } = requireQoderFamily(req.provider);
           const values2 = [];
+          let seenQoder = 0;
           for (const account of accounts) {
+            if (seenQoder++ > 0) await qoderSleep(qoderPaceDelayMs());
             const resolved = await ctx.credentials.resolve(credentialRef13(account.credentialRef));
             if (!resolved) {
               values2.push({
@@ -68274,6 +68724,11 @@ function apply(ctx, config = {}) {
         return available2.credential;
       }
       activeQoderAccountId.set(QODER.id, void 0);
+      // 池里没有可用账号有两种原因：全部限流中，或压根没登录过。前者若继续
+      // 往下走，兜底 ref（QODER_ACCESS_TOKEN）并不存在 → 返回 undefined →
+      // 上层抛「no usable credential; log in first」，把「等到解禁」误报成
+      // 「登录失效」。先抛带解禁时间的 QUOTA_EXCEEDED，用户才知道该等。
+      throwIfAllAccountsRateLimited(QODER, modelId);
       const resolved = await ctx.credentials.resolve(credentialRef16(QODER.defaultCredentialRef));
       if (!resolved) return void 0;
       try {
@@ -68309,6 +68764,8 @@ function apply(ctx, config = {}) {
         return available2.credential;
       }
       activeQoderAccountId.set(QODER_CN.id, void 0);
+      // 同 QODER：限流不得被误报成未登录（两站共用同一套池语义）。
+      throwIfAllAccountsRateLimited(QODER_CN, modelId);
       const resolved = await ctx.credentials.resolve(credentialRef16(QODER_CN.defaultCredentialRef));
       if (!resolved) return void 0;
       try {
