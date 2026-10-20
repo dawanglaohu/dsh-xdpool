@@ -6,7 +6,8 @@
 ### 改动
 - 安装源改为 `github:dawanglaohu/dsh-xdpool`（README 两种语言的首选方式）。`lib/` 构建产物本来就随仓库提交，所以 GitHub 安装不需要任何安装期脚本。
 - npm 方式降为次选，并明确标注：npm 上的 `dsh-xdpool` 归上游维护者，只发上游代码，不含本仓库的修复。
-- `package.json` 的 `homepage` / `bugs` / `repository` 与客户端卡片右上角的 Star 链接都指向本仓库；`author` 与 `LICENSE` 的版权署名保持上游 `XDTrees` 不变（MIT 要求保留原始版权声明）。
+- `package.json` 的 `homepage` / `bugs` / `repository` 与客户端卡片右上角的 Star 链接都指向本仓库；`author` 保持上游 `XDTrees` 不变，`LICENSE` 在原始版权声明之后追加一行 fork 维护者 `dawanglaohu`（MIT 要求保留原始声明，不能替换）。
+- `.github/workflows/README.md` 里 npm Trusted Publisher 表单的 `Organization or user` 改为 `dawanglaohu`（必须与仓库 owner 一致，否则 OIDC 发布失败）；`release.yml` 注释里那句「历史 Release 都是维护者本人身份（XDTrees）」改为不点名，因为这个仓库的维护者不是上游作者。
 - 顶部徽章：新增「install source: GitHub」指向本仓库，npm 版本徽章降级标注为 `npm (upstream)`。
 ## 未发布 — 模型饱和不再被当成账号限流
 > 一次「越换号越没得用」的雪崩：上游说「这个模型现在忙」，池子理解成「这个账号超限了」，于是把一个跟账号毫无关系的短暂拥堵，冷却成了整池一分钟不可用。

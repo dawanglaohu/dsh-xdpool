@@ -110,7 +110,7 @@ jobs:
         #
         # 这一步只能用 `secrets.GITHUB_TOKEN`（本仓库没有配置任何 PAT secret），
         # 而用它建出来的 Release，作者固定显示成 `github-actions[bot]`。本项目的
-        # 历史 Release 都是维护者本人身份（XDTrees），标题也带副标题
+        # 历史 Release 都是维护者本人身份（而不是 bot），标题也带副标题
         # （`v1.5.1 — 保留积分改为显式保存…`）。让 CI 建，页面就会出现作者忽而是
         # bot、标题忽而只剩版本号的参差——1.7.0 / 1.7.1 就是这么来的。
         #
