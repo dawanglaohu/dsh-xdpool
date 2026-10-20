@@ -9,7 +9,8 @@ import { dirname } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import type { SettingsNamespace } from '@deepseek-ai/dsh-settings'
-import { WorkBuddyAccountPool } from './accounts.ts'
+import { WorkBuddyAccountPool, workbuddyAccountId } from './accounts.ts'
+import type { WorkBuddyCredential } from './accounts.ts'
 import { WorkBuddyCatalog } from './catalog.ts'
 import {
   mountChannelPack,
@@ -67,6 +68,7 @@ import type {
   PoolWebCombo,
   PoolWebComboCandidate,
   PoolWebCombosStatus,
+  PoolWebProxyProbeResult,
   PoolWebRelayPatch,
 } from './status-paths.ts'
 import type { PoolRelayStatus as PoolWebRelayStatus } from './relay.ts'
@@ -280,6 +282,25 @@ import {
   writePreferredId,
 } from './preferred.ts'
 export { preferredIdPath, readPreferredId, readPreferredIdSync, writePreferredId } from './preferred.ts'
+// Per-account proxy bindings. Re-exported so the CLI can read and write the
+// same file the card does — the bindings are plugin-owned state, not settings,
+// for the reason the ignore list documents: a terminal with no host running
+// must be able to change them.
+import {
+  proxiesPath,
+  readProxiesSync,
+  setAccountProxies as writeAccountProxies,
+  type ProxyTable,
+} from './proxy-store.ts'
+export {
+  PROXIES_FILE_NAME,
+  proxiesPath,
+  readProxies,
+  readProxiesSync,
+  writeProxies,
+  setAccountProxies,
+} from './proxy-store.ts'
+import { maskProxy, redactProxy, resolveMaskedProxy, sendViaProxies } from './proxy-fetch.ts'
 export type { ModelSelection } from './catalog.ts'
 // The card half talks to these routes over HTTP; exporting the registrar and
 // its option shape lets a probe mount the real table instead of trusting that
@@ -414,6 +435,43 @@ export interface AutomationConfig {
 }
 /** Upper bound the card offers as the "default" context window, in tokens. */
 export const DEFAULT_CONTEXT_BUDGET = 200_000
+/**
+ * Targets for the per-proxy test button.
+ *
+ * The canary is the gateway the proxy exists to reach, so a hop that answers
+ * it is a hop that actually carries this plugin's traffic — a generic
+ * "is the internet up" URL would pass for a proxy that cannot reach WorkBuddy
+ * at all.
+ */
+const PROXY_CANARY_URL = 'https://www.workbuddy.ai/'
+/**
+ * Echo service for the egress address.
+ *
+ * Best-effort only: the address is a convenience for the user, so a chain that
+ * reaches the canary but not this host is still a working chain.
+ */
+const PROXY_IP_ECHO_URL = 'https://api.ipify.org?format=json'
+/**
+ * Ask an echo service what address one proxy hop presents.
+ *
+ * Best-effort by construction: the address is a convenience, and a hop that
+ * carries the canary but not this host is still a working hop. Every failure
+ * — timeout, non-2xx, unparseable body — collapses to `undefined` rather than
+ * propagating, so it can never turn a working hop into a reported failure.
+ */
+async function probeEgressIp(hop: string): Promise<string | undefined> {
+  try {
+    const response = await sendViaProxies([hop], PROXY_IP_ECHO_URL, {
+      method: 'GET',
+      signal: AbortSignal.timeout(5_000),
+    }, { connectTimeoutMs: 5_000 })
+    if (!response.ok) return undefined
+    const body = await response.json() as { ip?: unknown }
+    return typeof body.ip === 'string' && body.ip !== '' ? body.ip : undefined
+  } catch {
+    return undefined
+  }
+}
 /**
  * Fold a saved automation block into scheduler options.
  *
@@ -567,6 +625,12 @@ export interface WorkBuddyPoolApi {
   resetCooldowns(): void
   /** Daily-points automation; assembled with the core, inert until started. */
   scheduler: WorkBuddyScheduler
+  /** Replace one account's proxy chain; an empty list means direct. */
+  setAccountProxies(accountId: string, proxies: readonly string[]): Promise<void>
+  /** One account's chain as the card sees it: passwords replaced by a mask. */
+  accountProxies(accountId: string): readonly string[]
+  /** Dial one account's chain hop by hop; never throws, a dead hop is a result. */
+  testAccountProxies(accountId: string): Promise<readonly PoolWebProxyProbeResult[]>
 }
 /** Live API, published for the CLI. */
 let api: WorkBuddyPoolApi | undefined
@@ -588,7 +652,29 @@ export function setApi(next: WorkBuddyPoolApi | undefined): void {
  * seeding step read `accounts[0]`).
  */
 export function createCore(logger?: { warn(...args: unknown[]): void; info?(...args: unknown[]): void }) {
-  const client = new WorkBuddyUpstreamClient()
+  // Per-account proxy bindings, read ONCE (synchronously) and kept live.
+  //
+  // Same shape and same reason as the ignore list: `apply()` is synchronous,
+  // and an async load could resolve after the first request had already gone
+  // out — that request would leak the machine's own address for an account the
+  // user had bound to a proxy. Reading a few hundred bytes at startup removes
+  // the window.
+  //
+  // Every send then reads this in-memory table. No file I/O per request: the
+  // lookup sits on the hot path of every upstream call.
+  const proxiesFilePath = proxiesPath()
+  let proxyTable: ProxyTable = readProxiesSync(proxiesFilePath)
+  const refreshProxies = (next: ProxyTable): void => {
+    proxyTable = next
+  }
+  const proxyFor = (credential: WorkBuddyCredential): readonly string[] =>
+    proxyTable[workbuddyAccountId(credential)] ?? []
+  /** The same lookup keyed by account id, for the API methods below. */
+  const chainOf = (accountId: string): readonly string[] => proxyTable[accountId] ?? []
+  const client = new WorkBuddyUpstreamClient({
+    proxyFor,
+    ...logger === undefined ? {} : { proxyLogger: logger },
+  })
   // `persistent: true` is the production behaviour: without it the pool's
   // account list is pure memory, and because the desktop app keeps only the
   // CURRENT sign-in's credential file on disk, every account gathered by
@@ -602,7 +688,11 @@ export function createCore(logger?: { warn(...args: unknown[]): void; info?(...a
   // The scheduler is assembled here but stays inert until `start()`: the CLI and
   // the tests both build a core without wanting background traffic.
   const scheduler = new WorkBuddyScheduler(pool, client, { ...logger === undefined ? {} : { logger } })
-  return { pool, catalogs, client, scheduler }
+  // The proxy bindings travel with the core: the API methods below are the only
+  // writers, and they must update the very table the client reads from — two
+  // copies of that state would let a saved chain sit in a file that no send
+  // ever consults.
+  return { pool, catalogs, client, scheduler, proxies: { path: proxiesFilePath, refresh: refreshProxies, chainFor: proxyFor, chainOf } }
 }
 /**
  * Log a warning when the plugin and the host resolve different pi-ai
@@ -1105,6 +1195,82 @@ function canonicalJson(value: unknown): string {
   void relay.ready.catch((error: unknown) => {
     ctx.logger.warn(`xdpool relay: startup failed — ${String(error)}`)
   })
+  /**
+   * The three proxy operations, defined once and shared.
+   *
+   * They are needed twice — by the card's routes and by the published API the
+   * CLI uses — and two copies would be two chances to drift apart on the one
+   * detail that matters here: which table the write refreshes.
+   */
+  // Save one account's proxy chain. An empty array means "back to direct",
+  // which the store expresses by deleting the key rather than storing `[]`.
+  //
+  // The masked-password round trip is resolved HERE rather than in the route:
+  // the card is handed masked chains and echoes them back unchanged, so only
+  // the side holding the previous full chain can tell a kept password from a
+  // new one. A hop the resolver rejects is dropped rather than saved as-is —
+  // storing a literal mask would turn a working binding into one that fails
+  // authentication on every request.
+  const setAccountProxies = async (accountId: string, proxies: readonly string[]): Promise<void> => {
+    const previous = core.proxies.chainOf(accountId)
+    const resolved: string[] = []
+    for (const entry of proxies) {
+      const real = resolveMaskedProxy(entry, previous)
+      if (real !== undefined) resolved.push(real)
+    }
+    const next = await writeAccountProxies(accountId, resolved, core.proxies.path)
+    core.proxies.refresh(next)
+  }
+  // The masked view of an account's chain, for the card.
+  //
+  // Masked, not raw: the chain crosses the loopback route into a browser, and a
+  // proxy password is a credential for the proxy host. The card never needs the
+  // real one — it echoes the mask back and the save path above restores it.
+  const accountProxies = (accountId: string): readonly string[] =>
+    core.proxies.chainOf(accountId).map(maskProxy)
+  /**
+   * Dial one account's chain hop by hop and report each result.
+   *
+   * Each hop is tested alone: the question the button answers is "which link is
+   * dead", and a chain-level verdict could only say "something is". Hops are
+   * tried in order and none short-circuits, because a user fixing three proxies
+   * should learn about all three in one press.
+   *
+   * Never throws: a dead hop is the answer, not an error, so a rejection here
+   * would turn a diagnostic into a blank route failure.
+   */
+  const testAccountProxies = async (accountId: string): Promise<readonly PoolWebProxyProbeResult[]> => {
+    const chain = core.proxies.chainOf(accountId)
+    const results: PoolWebProxyProbeResult[] = []
+    for (const hop of chain) {
+      const started = Date.now()
+      try {
+        const response = await sendViaProxies([hop], PROXY_CANARY_URL, {
+          method: 'GET',
+          // A dead hop costs the whole connect timeout, so the cap here is about
+          // the button staying responsive, not about the request.
+          signal: AbortSignal.timeout(12_000),
+        }, { connectTimeoutMs: 8_000 })
+        const latencyMs = Date.now() - started
+        const egressIp = response.ok ? await probeEgressIp(hop) : undefined
+        results.push({
+          proxy: redactProxy(hop),
+          ok: response.ok,
+          status: response.status,
+          latencyMs,
+          ...egressIp === undefined ? {} : { egressIp },
+        })
+      } catch (error: unknown) {
+        results.push({
+          proxy: redactProxy(hop),
+          ok: false,
+          latencyMs: Date.now() - started,
+          error: describeError(error),
+        })
+      }
+    }
+    return results
+  }
   // Same-origin routes backing the XD Pool settings card. `webServer`
   // is an optional service: on a headless profile without it, no card routes
   // mount and the card shows an offline banner — the provider still works.
@@ -1157,6 +1323,9 @@ function canonicalJson(value: unknown): string {
         else delete next[accountId]
         await setSetting('creditReserves', next, next)
       },
+    setAccountProxies,
+    accountProxies,
+    testAccountProxies,
     // Throw one account out of the pool for good, or take it back.
     //
     // The ignore list is NOT a settings key: the CLI has no settings service, so
@@ -1509,6 +1678,9 @@ function canonicalJson(value: unknown): string {
     resetCooldowns() {
       core.pool.resetCooldowns()
     },
+    setAccountProxies,
+    accountProxies,
+    testAccountProxies,
   }
   // Start the automation last, once every runtime object exists: a tick firing
   // immediately must not find a half-applied core. The scheduler no-ops while

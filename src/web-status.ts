@@ -34,6 +34,8 @@ import {
   POOL_ACCOUNT_DISABLE_PATH,
   POOL_ACCOUNT_IGNORE_PATH,
   POOL_ACCOUNT_PREFER_PATH,
+  POOL_ACCOUNT_PROXY_PATH,
+  POOL_PROXY_TEST_PATH,
   POOL_AGGREGATE_DISCOVER_PATH,
   POOL_AGGREGATE_PATH,
   POOL_AGGREGATE_SAVE_PATH,
@@ -58,6 +60,7 @@ import {
   type PoolWebAccountToggle,
   type PoolWebAccountIgnore,
   type PoolWebAccountPrefer,
+  type PoolWebAccountProxyRequest,
   type PoolWebAutomationJob,
   type PoolWebCreditReserve,
   type PoolWebAutomationRun,
@@ -80,6 +83,7 @@ import {
   type PoolWebBillionStatus,
   type PoolWebModelProbe,
   type PoolWebModelProbeResult,
+  type PoolWebProxyProbeResult,
   type PoolWebRelayPatch,
 } from './status-paths.ts'
 import type { PoolRelayStatus as PoolWebRelayStatus } from './relay.ts'
@@ -123,6 +127,30 @@ export interface PoolStatusRouteOptions {
    * Absent without a settings service: the route then answers 503.
    */
   setCreditReserve?: (accountId: string, reserve: number) => Promise<void> | void
+  /**
+   * Persist one account's outbound proxy chain. An empty array clears it back to
+   * a direct dial, which is a value the user can save rather than a delete.
+   *
+   * Absent without a settings service: the save route then answers 503 instead
+   * of accepting a chain it cannot store.
+   */
+  setAccountProxies?: (accountId: string, proxies: readonly string[]) => Promise<void> | void
+  /**
+   * Dial one account's chain and report each hop. Slow by nature (a dead hop
+   * costs a whole connect timeout), so it is only ever called from the card's
+   * explicit "test" button, never while rendering.
+   *
+   * Absent when the host half has no proxy transport wired: the route then
+   * answers 503 rather than reporting a chain as fine without dialling it.
+   */
+  testAccountProxies?: (accountId: string) => Promise<readonly PoolWebProxyProbeResult[]>
+  /**
+   * The account's stored chain, already password-masked.
+   *
+   * Masking happens on the host side because that is where the secrets live; the
+   * status document must never carry a proxy password to the browser.
+   */
+  accountProxies?: (accountId: string) => readonly string[]
   /**
    * Persist the user's model selection. Provided by the host half, which owns
    * the settings section; absent when the plugin runs without a settings
@@ -566,6 +594,53 @@ function parseCreditReserve(
   if (!known(accountId)) return undefined
   return { accountId, reserve: Math.floor(raw) }
 }
+/** Proxy URL schemes the outbound transport can actually dial. */
+const PROXY_SCHEMES: ReadonlySet<string> = new Set(['http:', 'https:', 'socks5:', 'socks5h:'])
+/** Whether one chain entry is a proxy URL this transport can dial. */
+function isProxyUrl(raw: string): boolean {
+  let parsed: URL
+  try {
+    parsed = new URL(raw)
+  } catch {
+    return false
+  }
+  // `new URL('socks5://')` parses happily with an EMPTY host, so the scheme
+  // alone does not make an entry dialable — a hostless hop would fail at
+  // connect time, long after the save looked successful.
+  return PROXY_SCHEMES.has(parsed.protocol) && parsed.hostname !== ''
+}
+/**
+ * Parse a proxy-chain save.
+ *
+ * One bad entry rejects the WHOLE payload rather than being dropped: a chain
+ * that quietly lost a hop is worse than a refused save, because the user would
+ * then be debugging a proxy setup they never typed.
+ *
+ * An empty array is accepted and means "direct" — a real choice the card
+ * offers, not the absence of one.
+ *
+ * Entries may carry the masked password (`****`) the card was shown; that
+ * parses as an ordinary password component and is passed through untouched.
+ * Restoring the real secret belongs to whoever owns the store, not here.
+ */
+function parseAccountProxies(
+  body: Record<string, unknown>,
+  isKnownId: (id: string) => boolean,
+): PoolWebAccountProxyRequest | undefined {
+  const accountId = trimmed(body['accountId'])
+  if (accountId === '' || !isKnownId(accountId)) return undefined
+  const raw = body['proxies']
+  if (!Array.isArray(raw)) return undefined
+  const proxies: string[] = []
+  for (const entry of raw) {
+    if (typeof entry !== 'string') return undefined
+    const url = entry.trim()
+    if (url === '') continue
+    if (!isProxyUrl(url)) return undefined
+    proxies.push(url)
+  }
+  return { accountId, proxies }
+}
 function parseAutomationRun(body: Record<string, unknown>): PoolWebAutomationRun | undefined {
   const job = typeof body['job'] === 'string' ? body['job'].trim() : ''
   // 'all' runs the whole ordered pass, which is what the single button means.
@@ -713,7 +788,15 @@ export function aggregateStatusOf(
     providers,
   }
 }
-function toWebAccount(account: WorkBuddyAccount, disabled: boolean, preferred: boolean, reserve: number, reserved: boolean): PoolWebAccount {
+function toWebAccount(
+  account: WorkBuddyAccount,
+  disabled: boolean,
+  preferred: boolean,
+  reserve: number,
+  reserved: boolean,
+  proxies: readonly string[],
+  proxyHealth: PoolWebAccount['proxyHealth'],
+): PoolWebAccount {
   const now = Date.now()
   const cooling = account.cooldownUntilMs > now
   const deadUntil = account.credentialDeadUntilMs ?? 0
@@ -740,6 +823,9 @@ function toWebAccount(account: WorkBuddyAccount, disabled: boolean, preferred: b
     creditReserve: reserve,
     reserved,
     rateLimitHits: account.rateLimitHits,
+    proxies,
+    proxyCount: proxies.length,
+    proxyHealth,
   }
 }
 function toWebModel(
@@ -807,12 +893,22 @@ export async function poolWebStatus(
   const rows: PoolWebAccount[] = []
   const now = Date.now()
   for (const account of accounts) {
+    // Already-masked on the host side, so the row can be handed to the browser
+    // as-is. No chain means the account dials out directly, which is a healthy
+    // state rather than a missing one.
+    const proxies = deps.accountProxies?.(account.id) ?? []
     const row = toWebAccount(
       account,
       deps.pool.isDisabled(account.id),
       deps.pool.preferredId() === account.id,
       deps.pool.creditReserveOf(account.id),
       deps.pool.isReserved(account.id),
+      proxies,
+      // Health is reported from the chain's EXISTENCE only. The last probe
+      // verdict is not stored anywhere, and persisting one would keep showing
+      // "failing" long after the proxy was fixed; the live answer belongs to the
+      // self-test route, which reports it per hop.
+      proxies.length === 0 ? 'direct' : 'ok',
     )
     // Today's automation take for this account, when the host wired a scheduler.
     // Absent means "earned nothing today", which the card renders as silence.
@@ -1280,6 +1376,73 @@ export function registerPoolStatusRoute(ctx: Context, deps: PoolStatusRouteOptio
       },
     })
     /**
+     * Save one account's outbound proxy chain.
+     *
+     * POST only, loopback origin only, and the id must already be a known
+     * account, for the same reason the reserve route checks: an unknown id would
+     * be stored against nothing the pool can ever dial.
+     *
+     * The chain replaces whatever was stored, including with an empty array
+     * ("direct"), and it is NOT dialled here — a save must succeed while the
+     * proxy is down, which is exactly when the user is fixing it.
+     */
+    const disposeAccountProxies = ctx.webServer.register({
+      kind: 'exact',
+      path: POOL_ACCOUNT_PROXY_PATH,
+      handler: async (req: IncomingMessage, res: ServerResponse) => {
+        if (req.method !== 'POST') return json(res, 405, { error: 'method not allowed' })
+        if (!loopbackOrigin(req)) return json(res, 403, { error: 'origin-not-trusted' })
+        if (deps.setAccountProxies === undefined) {
+          return json(res, 503, { error: 'settings service unavailable; the proxies cannot be saved' })
+        }
+        try {
+          const body = await readJsonBody(req)
+          const known = new Set(deps.pool.list().map(account => account.id))
+          const parsed = parseAccountProxies(body, id => known.has(id))
+          if (parsed === undefined) return json(res, 400, { error: 'invalid proxy payload' })
+          await deps.setAccountProxies(parsed.accountId, parsed.proxies)
+          return json(res, 200, { ok: true, accountId: parsed.accountId, count: parsed.proxies.length })
+        } catch (error: unknown) {
+          return json(res, 500, { error: safeMessage(error) })
+        }
+      },
+    })
+    /**
+     * Dial one account's proxy chain and report each hop.
+     *
+     * POST only, loopback origin only. Slow by design — every dead hop costs a
+     * whole connect timeout — so the write is guarded: if the client gave up and
+     * the response is already finished, ending it again throws.
+     */
+    const disposeProxyTest = ctx.webServer.register({
+      kind: 'exact',
+      path: POOL_PROXY_TEST_PATH,
+      handler: async (req: IncomingMessage, res: ServerResponse) => {
+        if (req.method !== 'POST') return json(res, 405, { error: 'method not allowed' })
+        if (!loopbackOrigin(req)) return json(res, 403, { error: 'origin-not-trusted' })
+        if (deps.testAccountProxies === undefined) {
+          return json(res, 503, { error: 'proxy transport unavailable; the chain cannot be dialled' })
+        }
+        try {
+          const body = await readJsonBody(req)
+          const accountId = trimmed(body['accountId'])
+          const known = new Set(deps.pool.list().map(account => account.id))
+          if (accountId === '' || !known.has(accountId)) {
+            return json(res, 400, { error: 'invalid proxy probe payload' })
+          }
+          const results = await deps.testAccountProxies(accountId)
+          // The probe can outlive the caller: the card closed the tab or fired a
+          // second test. Nothing is waiting for an answer, and ending a finished
+          // response throws ERR_STREAM_WRITE_AFTER_END.
+          if (res.writableEnded) return
+          return json(res, 200, { ok: true, accountId, results })
+        } catch (error: unknown) {
+          if (res.writableEnded) return
+          return json(res, 500, { error: safeMessage(error) })
+        }
+      },
+    })
+    /**
      * Read the aggregate lane: the whole registry, each provider's state, and the
      * model rows the lane currently offers.
      *
@@ -1614,6 +1777,8 @@ export function registerPoolStatusRoute(ctx: Context, deps: PoolStatusRouteOptio
       disposeChannelModels()
       disposeAutomationRun()
       disposeCreditReserve()
+      disposeProxyTest()
+      disposeAccountProxies()
       disposeAccountIgnore()
       disposeAccountPrefer()
       disposeCatalogRefresh()

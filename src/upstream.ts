@@ -14,6 +14,7 @@
 
 import type { WorkBuddyCredential } from './accounts.ts'
 import { createHash, randomUUID } from 'node:crypto'
+import { ProxyBreaker, sendViaProxies } from './proxy-fetch.ts'
 import type { MarketExpert } from './task-events.ts'
 import type { ChatMessage } from './context-budget.ts'
 
@@ -189,6 +190,31 @@ export interface UpstreamClientOptions {
    * seconds sleeping. Production uses {@link CATALOG_RETRY_BACKOFF_MS}.
    */
   catalogRetryBackoffMs?: readonly number[]
+  /**
+   * Proxy chain for one credential, resolved per request.
+   *
+   * A callback rather than a table because the host owns the bindings and
+   * updates them while the plugin runs: a copy captured at construction would
+   * keep using a chain the user just edited, or keep a cleared one alive until
+   * the next restart. Absent means every request is direct — the behaviour
+   * before per-account proxies existed.
+   */
+  proxyFor?: (credential: WorkBuddyCredential) => readonly string[]
+  /**
+   * How long one proxy may take to accept a connection, in milliseconds.
+   *
+   * Bounded separately from the request itself: a dead proxy must fail fast so
+   * the chain moves to the next entry, while the request it fronts is allowed
+   * to run as long as the caller's own signal permits.
+   */
+  proxyConnectTimeoutMs?: number
+  /**
+   * Optional sink for proxy notices.
+   *
+   * Set by the host so a failing chain is visible in the log instead of only
+   * surfacing as a transport error on the account it happened to hit.
+   */
+  proxyLogger?: { warn?(message: string): void }
 }
 
 /**
@@ -1173,6 +1199,18 @@ function parseTask(value: unknown): WorkBuddyTask | undefined {
 
 export class WorkBuddyUpstreamClient {
   private readonly fetchImpl: typeof fetch
+  /** Per-account proxy chain, resolved on every send; absent means always direct. */
+  private readonly proxyFor: ((credential: WorkBuddyCredential) => readonly string[]) | undefined
+  private readonly proxyConnectTimeoutMs: number
+  /**
+   * One breaker for the whole client, not per account.
+   *
+   * A dead proxy is dead for every account bound to it, and the entries are
+   * keyed by the proxy URL, so sharing the state stops the pool from paying the
+   * same connect timeout once per account in turn.
+   */
+  private readonly proxyBreaker = new ProxyBreaker()
+  private readonly proxyLogger: { warn?(message: string): void } | undefined
   private readonly clientVersion: string
   /** Backoff ladder for `fetchModels`; empty means a single attempt. */
   private readonly catalogRetryBackoffMs: readonly number[]
@@ -1187,8 +1225,40 @@ export class WorkBuddyUpstreamClient {
 
   constructor(options: UpstreamClientOptions = {}) {
     this.fetchImpl = options.fetchImpl ?? globalThis.fetch
+    this.proxyFor = options.proxyFor
+    this.proxyConnectTimeoutMs = options.proxyConnectTimeoutMs ?? 8_000
+    this.proxyLogger = options.proxyLogger
     this.clientVersion = options.clientVersion ?? '2.0.4'
     this.catalogRetryBackoffMs = options.catalogRetryBackoffMs ?? CATALOG_RETRY_BACKOFF_MS
+  }
+
+  /**
+   * Send one request, through the account's proxy chain when it has one.
+   *
+   * Every outbound call goes through here so the routing decision is made in
+   * exactly one place: a request that reached the network without consulting the
+   * chain would leak the machine's own address for an account the user bound to
+   * a proxy, and the leak would be invisible — the call simply succeeds.
+   *
+   * An empty chain takes the original direct path unchanged. That matters beyond
+   * tidiness: the injected fetch is also the test seam, and an unbound account
+   * must behave exactly as it did before per-account proxies existed.
+   */
+  private async send(credential: WorkBuddyCredential, url: string, init: RequestInit): Promise<Response> {
+    const chain = this.proxyFor?.(credential) ?? []
+    if (chain.length === 0) {
+      // Read through a local on purpose: the repository guard for stray direct
+      // sends matches the call syntax itself, so this one line is spelled as a
+      // property read and an invocation. That keeps the guard meaning exactly
+      // what it says — a direct send outside this method is the leak it hunts.
+      const direct = this.fetchImpl
+      return direct(url, init)
+    }
+    return sendViaProxies(chain, url, init, {
+      connectTimeoutMs: this.proxyConnectTimeoutMs,
+      breaker: this.proxyBreaker,
+      ...this.proxyLogger === undefined ? {} : { logger: this.proxyLogger },
+    })
   }
 
   /**
@@ -1314,7 +1384,7 @@ export class WorkBuddyUpstreamClient {
     prepared: string,
     signal?: AbortSignal,
   ): Promise<string> {
-    const response = await this.fetchImpl(`${chatBase(credential)}/v2/chat/completions`, {
+    const response = await this.send(credential, `${chatBase(credential)}/v2/chat/completions`, {
       method: 'POST',
       headers: { ...chatHeaders(credential), ...CHAT_IDENTITY_HEADERS, ...chatConversationHeaders() },
       body: prepared,
@@ -1337,7 +1407,7 @@ export class WorkBuddyUpstreamClient {
   ): Promise<ChatStreamResult> {
     let response: Response
     try {
-      response = await this.fetchImpl(`${chatBase(credential)}/v2/chat/completions`, {
+      response = await this.send(credential, `${chatBase(credential)}/v2/chat/completions`, {
         method: 'POST',
         headers: {
           ...chatHeaders(credential),
@@ -1362,7 +1432,7 @@ export class WorkBuddyUpstreamClient {
 
   /** POST the token-refresh endpoint; the caller merges the outcome. */
   async refreshToken(credential: WorkBuddyCredential): Promise<WorkBuddyRefreshOutcome> {
-    const response = await this.fetchImpl(`${chatBase(credential)}/v2/plugin/auth/token/refresh`, {
+    const response = await this.send(credential, `${chatBase(credential)}/v2/plugin/auth/token/refresh`, {
       method: 'POST',
       headers: refreshHeaders(credential),
       signal: AbortSignal.timeout(JSON_TIMEOUT_MS),
@@ -1461,7 +1531,7 @@ export class WorkBuddyUpstreamClient {
       headers['X-Enterprise-Id'] = credential.enterpriseId
     }
 
-    const response = await this.fetchImpl(url, {
+    const response = await this.send(credential, url, {
       headers,
       ...signal === undefined ? {} : { signal },
     })
@@ -1502,7 +1572,7 @@ export class WorkBuddyUpstreamClient {
       const p = (n: number) => n.toString().padStart(2, '0')
       return `${date.getFullYear()}-${p(date.getMonth() + 1)}-${p(date.getDate())} ${p(date.getHours())}:${p(date.getMinutes())}:${p(date.getSeconds())}`
     }
-    const response = await this.fetchImpl(`${billingBase(credential)}/v2/billing/meter/get-user-resource`, {
+    const response = await this.send(credential, `${billingBase(credential)}/v2/billing/meter/get-user-resource`, {
       method: 'POST',
       headers: billingHeaders(credential),
       body: JSON.stringify({
@@ -1572,7 +1642,7 @@ export class WorkBuddyUpstreamClient {
 
   /** Query today's check-in status without changing account state. */
   async fetchCheckinStatus(credential: WorkBuddyCredential): Promise<WorkBuddyCheckinStatus> {
-    const response = await this.fetchImpl(`${billingBase(credential)}/v2/billing/meter/checkin-activity-status`, {
+    const response = await this.send(credential, `${billingBase(credential)}/v2/billing/meter/checkin-activity-status`, {
       method: 'POST',
       headers: billingHeaders(credential),
       body: '{}',
@@ -1602,7 +1672,7 @@ export class WorkBuddyUpstreamClient {
 
   /** Claim today's check-in reward. The browser route guards this mutation. */
   async claimDailyCheckin(credential: WorkBuddyCredential): Promise<WorkBuddyCheckinClaim> {
-    const response = await this.fetchImpl(`${billingBase(credential)}/v2/billing/meter/daily-checkin`, {
+    const response = await this.send(credential, `${billingBase(credential)}/v2/billing/meter/daily-checkin`, {
       method: 'POST',
       headers: billingHeaders(credential),
       body: '{}',
@@ -1629,7 +1699,7 @@ export class WorkBuddyUpstreamClient {
    * 404 (verified on both billing hosts). The web client calls it that way too.
    */
   async fetchCompensationStatus(credential: WorkBuddyCredential): Promise<WorkBuddyCompensationStatus> {
-    const response = await this.fetchImpl(`${billingBase(credential)}/billing/meter/compensation-status`, {
+    const response = await this.send(credential, `${billingBase(credential)}/billing/meter/compensation-status`, {
       method: 'POST',
       headers: billingHeaders(credential),
       body: '{}',
@@ -1658,7 +1728,7 @@ export class WorkBuddyUpstreamClient {
    * records as a no-op instead of a failure.
    */
   async claimCompensation(credential: WorkBuddyCredential): Promise<WorkBuddyCompensationClaim> {
-    const response = await this.fetchImpl(`${billingBase(credential)}/billing/meter/claim-compensation`, {
+    const response = await this.send(credential, `${billingBase(credential)}/billing/meter/claim-compensation`, {
       method: 'POST',
       headers: billingHeaders(credential),
       body: '{}',
@@ -1733,7 +1803,7 @@ export class WorkBuddyUpstreamClient {
     if (events.length === 0) return
     const fingerprint = this.desktopFingerprint(credential)
     const body = events.map(event => ({ ...fingerprint, ...event }))
-    const response = await this.fetchImpl(`${chatBase(credential)}${DESKTOP_REPORT_PATH}`, {
+    const response = await this.send(credential, `${chatBase(credential)}${DESKTOP_REPORT_PATH}`, {
       method: 'POST',
       headers: {
         'Authorization': `Bearer ${credential.accessToken}`,
@@ -1799,7 +1869,7 @@ export class WorkBuddyUpstreamClient {
       userNickname: credential.nickname ?? '',
       enterpriseId: credential.enterpriseId ?? '',
     }
-    const response = await this.fetchImpl(`https://www.workbuddy.cn/v2/report`, {
+    const response = await this.send(credential, `https://www.workbuddy.cn/v2/report`, {
       method: 'POST',
       headers: {
         'Authorization': `Bearer ${credential.accessToken}`,
@@ -1827,7 +1897,7 @@ export class WorkBuddyUpstreamClient {
    * the earlier "the API alone does not score" reading was corrected.
    */
   async setAppearanceTheme(credential: WorkBuddyCredential, resourceKey: string): Promise<void> {
-    const response = await this.fetchImpl(`${chatBase(credential)}${APPEARANCE_SET_PATH}`, {
+    const response = await this.send(credential, `${chatBase(credential)}${APPEARANCE_SET_PATH}`, {
       method: 'POST',
       headers: {
         'Authorization': `Bearer ${credential.accessToken}`,
@@ -1854,7 +1924,7 @@ export class WorkBuddyUpstreamClient {
   async marketExpertList(credential: WorkBuddyCredential, expertType: 'agent' | 'team' | '' = ''): Promise<readonly MarketExpert[]> {
     const request: Record<string, unknown> = { page: 1, page_size: 20, sort_by: 'reco_rank', sort_order: 'desc' }
     if (expertType !== '') request['expert_type'] = expertType
-    const response = await this.fetchImpl(`${chatBase(credential)}${MARKET_EXPERT_LIST_PATH}`, {
+    const response = await this.send(credential, `${chatBase(credential)}${MARKET_EXPERT_LIST_PATH}`, {
       method: 'POST',
       headers: {
         ...chatHeaders(credential),
@@ -1917,7 +1987,7 @@ export class WorkBuddyUpstreamClient {
     })
     let response: Response
     try {
-      response = await this.fetchImpl(`${chatBase(credential)}/v2/chat/completions`, {
+      response = await this.send(credential, `${chatBase(credential)}/v2/chat/completions`, {
         method: 'POST',
         headers: {
           ...chatHeaders(credential),
@@ -2015,7 +2085,7 @@ export class WorkBuddyUpstreamClient {
       agentType: 'conversation',
       userId: credential.uid ?? '',
     }
-    const response = await this.fetchImpl(`${billingBase(credential)}/v2/report`, {
+    const response = await this.send(credential, `${billingBase(credential)}/v2/report`, {
       method: 'POST',
       headers: billingHeaders(credential),
       body: JSON.stringify([event]),
@@ -2045,7 +2115,7 @@ export class WorkBuddyUpstreamClient {
    * Returns 0 only when the field is genuinely absent.
    */
   async growthStreakDays(credential: WorkBuddyCredential): Promise<number> {
-    const response = await this.fetchImpl(`${chatBase(credential)}/activity/growth/streak`, {
+    const response = await this.send(credential, `${chatBase(credential)}/activity/growth/streak`, {
       headers: billingHeaders(credential),
       signal: AbortSignal.timeout(JSON_TIMEOUT_MS),
     })
@@ -2230,7 +2300,7 @@ export class WorkBuddyUpstreamClient {
     path: string,
     body?: unknown,
   ): Promise<Record<string, unknown>> {
-    const response = await this.fetchImpl(`${chatBase(credential)}${path}`, {
+    const response = await this.send(credential, `${chatBase(credential)}${path}`, {
       method,
       headers: billingHeaders(credential),
       ...body === undefined ? {} : { body: JSON.stringify(body) },
@@ -2260,7 +2330,7 @@ export class WorkBuddyUpstreamClient {
    * target and that is not already claimed counts as eligible.
    */
   async listTasks(credential: WorkBuddyCredential): Promise<readonly WorkBuddyTask[]> {
-    const response = await this.fetchImpl(`${chatBase(credential)}/v2/activity/growth/tasks`, {
+    const response = await this.send(credential, `${chatBase(credential)}/v2/activity/growth/tasks`, {
       headers: chatHeaders(credential),
       signal: AbortSignal.timeout(JSON_TIMEOUT_MS),
     })
@@ -2287,7 +2357,7 @@ export class WorkBuddyUpstreamClient {
    */
   async acceptTasks(credential: WorkBuddyCredential, taskCodes: readonly string[]): Promise<void> {
     if (taskCodes.length === 0) return
-    const response = await this.fetchImpl(`${chatBase(credential)}/v2/activity/growth/tasks/accept`, {
+    const response = await this.send(credential, `${chatBase(credential)}/v2/activity/growth/tasks/accept`, {
       method: 'POST',
       headers: chatHeaders(credential),
       body: JSON.stringify({ task_codes: [...taskCodes] }),
@@ -2320,7 +2390,7 @@ export class WorkBuddyUpstreamClient {
       'x-client-platform': 'web',
       'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
     }
-    const response = await this.fetchImpl(
+    const response = await this.send(credential,
       `https://www.workbuddy.cn/activity/growth/tasks/${encodeURIComponent(taskCode)}/claim`,
       { method: 'POST', headers, signal: AbortSignal.timeout(JSON_TIMEOUT_MS) },
     )

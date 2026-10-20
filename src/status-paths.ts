@@ -54,6 +54,27 @@ export const POOL_CREDIT_RESERVE_PATH = '/plugins/dsh-xdpool/accounts/credit-res
  */
 export const POOL_ACCOUNT_PREFER_PATH = '/plugins/dsh-xdpool/accounts/preferred'
 /**
+ * Save one account's outbound proxy chain, or clear it back to a direct dial.
+ *
+ * Per-account rather than one global proxy setting because the whole point is
+ * that each account egresses from its own address: a shared proxy would put
+ * every account back on the same IP, which is the thing being avoided.
+ *
+ * An empty chain is a real, saveable value — it means "no proxy for this
+ * account" — so the route must accept it rather than treat it as "nothing to
+ * save".
+ */
+export const POOL_ACCOUNT_PROXY_PATH = '/plugins/dsh-xdpool/accounts/proxies'
+/**
+ * Dial one account's proxy chain and report whether each hop works.
+ *
+ * Separate from {@link POOL_ACCOUNT_PROXY_PATH} because a save must stay fast
+ * and must succeed even when the proxy is currently unreachable — the user is
+ * allowed to store a chain and debug it afterwards. Probing is slow (a dead hop
+ * costs a full connect timeout) and is only run when the card asks.
+ */
+export const POOL_PROXY_TEST_PATH = '/plugins/dsh-xdpool/accounts/proxies/test'
+/**
  * Read the aggregate lane's state: every registry provider, its saved setting
  * (never its key), and whether it can serve anything right now.
  *
@@ -635,6 +656,49 @@ export interface PoolWebCreditReserve {
   /** Credits to keep. 0 clears the reserve. */
   reserve: number
 }
+/**
+ * Body of the proxy-save route: the whole chain for one account, replacing
+ * whatever was stored before.
+ *
+ * The chain is sent as a whole rather than as add/remove operations because the
+ * card edits a list and a full replace cannot leave the store half-updated. An
+ * empty array is valid and means "direct".
+ *
+ * Entries may arrive with the password masked as `****`, since the card only
+ * ever sees the masked chain; restoring the real secret is the Host's job.
+ */
+export interface PoolWebAccountProxyRequest {
+  /** Pool account id, as reported in `PoolWebAccount.id`. */
+  accountId: string
+  /** Ordered proxy URLs (first hop first). Empty = direct connection. */
+  proxies: string[]
+}
+/** Body of the proxy self-test route: exactly one account per request. */
+export interface PoolWebProxyProbeRequest {
+  /** Pool account id, as reported in `PoolWebAccount.id`. */
+  accountId: string
+}
+/**
+ * One hop's probe outcome.
+ *
+ * Reported per hop rather than as a single pass/fail because a chain fails one
+ * link at a time, and "the third proxy is dead" is the only answer that lets the
+ * user fix it.
+ */
+export interface PoolWebProxyProbeResult {
+  /** The hop that was dialled, password-masked. */
+  proxy: string
+  /** Whether the hop answered and carried a request through. */
+  ok: boolean
+  /** HTTP status of the probe request, when the hop got that far. */
+  status?: number
+  /** Round-trip time of the probe, ms. */
+  latencyMs?: number
+  /** Address the far end saw us as, when the probe could report it. */
+  egressIp?: string
+  /** Why the hop failed, when it did. */
+  error?: string
+}
 /** Body of the "run now" endpoint: exactly one job per request. */
 export interface PoolWebAutomationRun {
   /** Which job to run: checkin / report / tasks / streak. */
@@ -736,6 +800,29 @@ export interface PoolWebAccount {
    */
   checkin?: PoolWebCheckin
   checkinError?: string
+  /**
+   * This account's outbound proxy chain, password-masked (`****`). Empty means
+   * the account dials out directly.
+   *
+   * Masked on purpose: the status document travels to the browser, and a proxy
+   * password is a credential like any other. The card only needs the shape of
+   * the chain to render it, and a masked value round-trips back through the save
+   * route unchanged.
+   */
+  proxies: readonly string[]
+  /** How many hops are configured. Survives masking, so the card can say "x2". */
+  proxyCount: number
+  /**
+   * `direct` = no chain, `ok` = a chain is configured and nothing is known
+   * against it, `failing` = at least one hop failed recently.
+   *
+   * Health is deliberately NOT persisted across requests: the only evidence this
+   * plugin has is the last probe the user ran, and storing a stale verdict would
+   * show "failing" long after the proxy was fixed. So `failing` only ever
+   * appears where a probe result is being reported, and the status document
+   * reports the chain's existence instead.
+   */
+  proxyHealth: 'direct' | 'ok' | 'failing'
 }
 /** One credit package (as surfaced by the pool's upstream client), node-free. */
 export interface PoolWebCreditPackage {

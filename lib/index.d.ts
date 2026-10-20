@@ -327,6 +327,33 @@ interface UpstreamClientOptions {
    * seconds sleeping. Production uses {@link CATALOG_RETRY_BACKOFF_MS}.
    */
   catalogRetryBackoffMs?: readonly number[];
+  /**
+   * Proxy chain for one credential, resolved per request.
+   *
+   * A callback rather than a table because the host owns the bindings and
+   * updates them while the plugin runs: a copy captured at construction would
+   * keep using a chain the user just edited, or keep a cleared one alive until
+   * the next restart. Absent means every request is direct — the behaviour
+   * before per-account proxies existed.
+   */
+  proxyFor?: (credential: WorkBuddyCredential) => readonly string[];
+  /**
+   * How long one proxy may take to accept a connection, in milliseconds.
+   *
+   * Bounded separately from the request itself: a dead proxy must fail fast so
+   * the chain moves to the next entry, while the request it fronts is allowed
+   * to run as long as the caller's own signal permits.
+   */
+  proxyConnectTimeoutMs?: number;
+  /**
+   * Optional sink for proxy notices.
+   *
+   * Set by the host so a failing chain is visible in the log instead of only
+   * surfacing as a transport error on the account it happened to hit.
+   */
+  proxyLogger?: {
+    warn?(message: string): void;
+  };
 }
 /** Region for a login domain; an empty domain means CN (matching upstream tooling). */
 /** The two gateways WorkBuddy serves: the domestic one and the international one. */
@@ -459,6 +486,18 @@ export declare function desktopAutomationCreatedEvent(name: string): Record<stri
 export declare function buddyAppEvents(buddyId: string, buddyName: string): Record<string, unknown>[];
 export declare class WorkBuddyUpstreamClient {
   private readonly fetchImpl;
+  /** Per-account proxy chain, resolved on every send; absent means always direct. */
+  private readonly proxyFor;
+  private readonly proxyConnectTimeoutMs;
+  /**
+   * One breaker for the whole client, not per account.
+   *
+   * A dead proxy is dead for every account bound to it, and the entries are
+   * keyed by the proxy URL, so sharing the state stops the pool from paying the
+   * same connect timeout once per account in turn.
+   */
+  private readonly proxyBreaker;
+  private readonly proxyLogger;
   private readonly clientVersion;
   /** Backoff ladder for `fetchModels`; empty means a single attempt. */
   private readonly catalogRetryBackoffMs;
@@ -474,6 +513,19 @@ export declare class WorkBuddyUpstreamClient {
     info?(...args: unknown[]): void;
   } | undefined;
   constructor(options?: UpstreamClientOptions);
+  /**
+   * Send one request, through the account's proxy chain when it has one.
+   *
+   * Every outbound call goes through here so the routing decision is made in
+   * exactly one place: a request that reached the network without consulting the
+   * chain would leak the machine's own address for an account the user bound to
+   * a proxy, and the leak would be invisible — the call simply succeeds.
+   *
+   * An empty chain takes the original direct path unchanged. That matters beyond
+   * tidiness: the injected fetch is also the test seam, and an unbound account
+   * must behave exactly as it did before per-account proxies existed.
+   */
+  private send;
   /**
    * Normalize an OpenAI chat-completions body for the WorkBuddy upstream:
    * force `stream: true` (the upstream rejects non-streaming), convert the
@@ -1746,6 +1798,27 @@ interface PoolWebAggregateProbe {
   /** How many ids the discover action wrote back. Absent on a plain probe. */
   committed?: number;
 }
+/**
+ * One hop's probe outcome.
+ *
+ * Reported per hop rather than as a single pass/fail because a chain fails one
+ * link at a time, and "the third proxy is dead" is the only answer that lets the
+ * user fix it.
+ */
+interface PoolWebProxyProbeResult {
+  /** The hop that was dialled, password-masked. */
+  proxy: string;
+  /** Whether the hop answered and carried a request through. */
+  ok: boolean;
+  /** HTTP status of the probe request, when the hop got that far. */
+  status?: number;
+  /** Round-trip time of the probe, ms. */
+  latencyMs?: number;
+  /** Address the far end saw us as, when the probe could report it. */
+  egressIp?: string;
+  /** Why the hop failed, when it did. */
+  error?: string;
+}
 /** One account's row, token-free. */
 interface PoolWebAccount {
   id: string;
@@ -1823,6 +1896,29 @@ interface PoolWebAccount {
    */
   checkin?: PoolWebCheckin;
   checkinError?: string;
+  /**
+   * This account's outbound proxy chain, password-masked (`****`). Empty means
+   * the account dials out directly.
+   *
+   * Masked on purpose: the status document travels to the browser, and a proxy
+   * password is a credential like any other. The card only needs the shape of
+   * the chain to render it, and a masked value round-trips back through the save
+   * route unchanged.
+   */
+  proxies: readonly string[];
+  /** How many hops are configured. Survives masking, so the card can say "x2". */
+  proxyCount: number;
+  /**
+   * `direct` = no chain, `ok` = a chain is configured and nothing is known
+   * against it, `failing` = at least one hop failed recently.
+   *
+   * Health is deliberately NOT persisted across requests: the only evidence this
+   * plugin has is the last probe the user ran, and storing a stale verdict would
+   * show "failing" long after the proxy was fixed. So `failing` only ever
+   * appears where a probe result is being reported, and the status document
+   * reports the chain's existence instead.
+   */
+  proxyHealth: 'direct' | 'ok' | 'failing';
 }
 /** One credit package (as surfaced by the pool's upstream client), node-free. */
 interface PoolWebCreditPackage {
@@ -3588,6 +3684,71 @@ export declare function readPreferredIdSync(path?: string): string | undefined;
  */
 export declare function writePreferredId(accountId: string | undefined, path?: string): Promise<void>;
 //#endregion
+//#region src/proxy-store.d.ts
+/**
+ * Per-account egress proxies: which account leaves the machine through which
+ * address.
+ *
+ * Kept in a plugin-owned file rather than in the settings document for the same
+ * reason as the ignore list: the CLI has no settings service. A table written
+ * only by the card could never be read by dsh-xdpool from a terminal, and the
+ * two views of "where does this account leave from" would drift.
+ *
+ * Two properties of the shape carry meaning, so they are not incidental:
+ *
+ * - The array is an ORDERED FALLBACK LIST. Index 0 is the account's primary
+ *   egress; the rest are tried in turn when it fails. Treating it as a set
+ *   would silently pick a different primary.
+ * - An ABSENT key means direct. An empty array means the same thing, so it is
+ *   never written: a key holding [] would be a second spelling of "direct" and
+ *   every reader would need to know about both.
+ *
+ * @module dsh-xdpool/proxy-store
+ */
+/** File holding the per-account proxy table, inside {@link pluginDataDir}. */
+export declare const PROXIES_FILE_NAME = "proxies.json";
+/** Account id to its ordered proxy chain. Absent means "direct". */
+type ProxyTable = Readonly<Record<string, readonly string[]>>;
+/**
+ * Absolute path of the proxy table.
+ *
+ * Resolved through {@link pluginDataDir} rather than recomputing DSH_HOME here:
+ * a second copy of that rule is a second place for the host and the CLI to
+ * disagree about which file they are talking about.
+ */
+export declare function proxiesPath(env?: NodeJS.ProcessEnv): string;
+/** Read the table, tolerating every "nothing configured yet" shape. */
+export declare function readProxies(path?: string): Promise<ProxyTable>;
+/**
+ * Synchronous read, for startup.
+ *
+ * The host applies the table from inside its synchronous apply(), and doing it
+ * there removes a startup race: an async load could resolve AFTER the first
+ * account scan and route one request direct that should have been proxied. The
+ * file is a few hundred bytes.
+ */
+export declare function readProxiesSync(path?: string): ProxyTable;
+/**
+ * Replace the table, atomically.
+ *
+ * Written to a sibling temp file and renamed over the target so a crash cannot
+ * leave a half-written document: a truncated proxy table reads as "everything
+ * is direct", which would quietly move every account onto the user's own IP —
+ * the exact leak the feature exists to prevent.
+ */
+export declare function writeProxies(table: ProxyTable, path?: string): Promise<void>;
+/**
+ * Set one account's chain, preserving every other account.
+ *
+ * A read-modify-write rather than a wholesale replace: the card and the CLI can
+ * both be open, and each request names exactly one account, so re-writing the
+ * whole table from a stale view would drop the other side's edits.
+ *
+ * An empty chain DELETES the key rather than storing [], so "direct" has exactly
+ * one on-disk spelling. Returns the table as written.
+ */
+export declare function setAccountProxies(accountId: string, proxies: readonly string[], path?: string): Promise<ProxyTable>;
+//#endregion
 //#region src/relay.d.ts
 interface PoolRelayStatus {
   enabled: boolean;
@@ -3643,6 +3804,30 @@ interface PoolStatusRouteOptions {
    * Absent without a settings service: the route then answers 503.
    */
   setCreditReserve?: (accountId: string, reserve: number) => Promise<void> | void;
+  /**
+   * Persist one account's outbound proxy chain. An empty array clears it back to
+   * a direct dial, which is a value the user can save rather than a delete.
+   *
+   * Absent without a settings service: the save route then answers 503 instead
+   * of accepting a chain it cannot store.
+   */
+  setAccountProxies?: (accountId: string, proxies: readonly string[]) => Promise<void> | void;
+  /**
+   * Dial one account's chain and report each hop. Slow by nature (a dead hop
+   * costs a whole connect timeout), so it is only ever called from the card's
+   * explicit "test" button, never while rendering.
+   *
+   * Absent when the host half has no proxy transport wired: the route then
+   * answers 503 rather than reporting a chain as fine without dialling it.
+   */
+  testAccountProxies?: (accountId: string) => Promise<readonly PoolWebProxyProbeResult[]>;
+  /**
+   * The account's stored chain, already password-masked.
+   *
+   * Masking happens on the host side because that is where the secrets live; the
+   * status document must never carry a proxy password to the browser.
+   */
+  accountProxies?: (accountId: string) => readonly string[];
   /**
    * Persist the user's model selection. Provided by the host half, which owns
    * the settings section; absent when the plugin runs without a settings
@@ -3995,6 +4180,12 @@ export interface WorkBuddyPoolApi {
   resetCooldowns(): void;
   /** Daily-points automation; assembled with the core, inert until started. */
   scheduler: WorkBuddyScheduler;
+  /** Replace one account's proxy chain; an empty list means direct. */
+  setAccountProxies(accountId: string, proxies: readonly string[]): Promise<void>;
+  /** One account's chain as the card sees it: passwords replaced by a mask. */
+  accountProxies(accountId: string): readonly string[];
+  /** Dial one account's chain hop by hop; never throws, a dead hop is a result. */
+  testAccountProxies(accountId: string): Promise<readonly PoolWebProxyProbeResult[]>;
 }
 /** The live API, or undefined when the plugin has not applied yet. */
 export declare function currentApi(): WorkBuddyPoolApi | undefined;
@@ -4020,6 +4211,12 @@ export declare function createCore(logger?: {
   };
   client: WorkBuddyUpstreamClient;
   scheduler: WorkBuddyScheduler;
+  proxies: {
+    path: string;
+    refresh: (next: ProxyTable) => void;
+    chainFor: (credential: WorkBuddyCredential) => readonly string[];
+    chainOf: (accountId: string) => readonly string[];
+  };
 };
 /**
  * Start the loopback endpoint, register the `xdpool` provider, and

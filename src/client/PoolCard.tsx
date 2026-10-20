@@ -22,12 +22,14 @@ import {
   POOL_ACCOUNT_DISABLE_PATH,
   POOL_ACCOUNT_IGNORE_PATH,
   POOL_ACCOUNT_PREFER_PATH,
+  POOL_ACCOUNT_PROXY_PATH,
   POOL_AUTOMATION_RUN_PATH,
   POOL_CATALOG_REFRESH_PATH,
   POOL_CREDIT_RESERVE_PATH,
   POOL_CHECKIN_PATH,
   POOL_MODELS_SAVE_PATH,
   POOL_MODEL_PROBE_PATH,
+  POOL_PROXY_TEST_PATH,
   POOL_RESET_COOLDOWN_PATH,
   POOL_RESCAN_PATH,
   POOL_STATUS_PATH,
@@ -37,6 +39,7 @@ import {
   type PoolWebChannel,
   type PoolWebModel,
   type PoolWebModelProbeResult,
+  type PoolWebProxyProbeResult,
   type PoolWebStatus,
   type PoolRegion,
   type PoolWebCreditPackage,
@@ -542,6 +545,17 @@ export function PoolCard({ t, settingsScope }: PoolCardProps) {
   const [savingModelsRegion, setSavingModelsRegion] = useState<PoolRegion | undefined>(undefined)
   /** Account id whose reserved-credit floor is being saved, if any. */
   const [reserveBusy, setReserveBusy] = useState<string | undefined>(undefined)
+  /** Account id whose proxy list is being written, if any. */
+  const [proxyBusy, setProxyBusy] = useState<string | undefined>(undefined)
+  /**
+   * Account id whose proxy connectivity test is in flight, if any.
+   *
+   * Separate from {@link proxyBusy} on purpose: a test is a read-only probe the
+   * user fires to learn something, a save is a write that changes what the
+   * account will use next. Sharing one flag would make the Save button look
+   * busy while a test runs and disable the very control that is being checked.
+   */
+  const [proxyTestBusyId, setProxyTestBusyId] = useState<string | undefined>(undefined)
   const [flash, setFlash] = useState<string | undefined>(undefined)
   /** Account id whose daily claim is currently in flight. */
   const [checkinBusyId, setCheckinBusyId] = useState<string | undefined>(undefined)
@@ -1293,6 +1307,79 @@ export function PoolCard({ t, settingsScope }: PoolCardProps) {
       if (mounted.current) setReserveBusy(undefined)
     }
   }
+  /**
+   * Save one account's proxy list, in the order the user typed it.
+   *
+   * An empty list is a real answer, not a missing one: it means "this account
+   * goes out directly", so it is written rather than skipped — otherwise there
+   * would be no way back from a proxy that turned out to be dead.
+   *
+   * Returns whether the host CONFIRMED the write, so the row can settle on what
+   * it actually stored instead of on what the user hoped it stored.
+   */
+  const saveAccountProxies = async (
+    region: PoolRegion,
+    accountId: string,
+    lines: string[],
+  ): Promise<boolean> => {
+    setProxyBusy(accountId)
+    setFlash(undefined)
+    try {
+      const response = await fetch(POOL_ACCOUNT_PROXY_PATH, {
+        method: 'POST',
+        headers: { 'accept': 'application/json', 'content-type': 'application/json' },
+        credentials: 'same-origin',
+        body: JSON.stringify({ accountId, proxies: lines }),
+      })
+      const body = await response.json() as { error?: string }
+      if (!response.ok) throw new Error(body.error ?? `HTTP ${response.status}`)
+      await refresh(region)
+      if (mounted.current) {
+        setFlash(lines.length === 0
+          ? (t?.('row.proxyCleared') ?? 'Cleared - direct')
+          : (t?.('row.proxySaved') ?? 'Saved'))
+      }
+      return true
+    } catch (cause: unknown) {
+      if (mounted.current) setError(cause instanceof Error ? cause.message : String(cause))
+      return false
+    } finally {
+      if (mounted.current) setProxyBusy(undefined)
+    }
+  }
+  /**
+   * Probe every proxy this account has, through the host.
+   *
+   * The card cannot dial a SOCKS endpoint itself, so the answer comes from the
+   * host's own connector — the same code path a real request would take, which
+   * is what makes "OK" mean something rather than "the string parsed".
+   */
+  const testAccountProxies = async (accountId: string): Promise<PoolWebProxyProbeResult[]> => {
+    setProxyTestBusyId(accountId)
+    setFlash(undefined)
+    try {
+      const response = await fetch(POOL_PROXY_TEST_PATH, {
+        method: 'POST',
+        headers: { 'accept': 'application/json', 'content-type': 'application/json' },
+        credentials: 'same-origin',
+        body: JSON.stringify({ accountId }),
+      })
+      const body = await response.json() as {
+        ok?: boolean
+        results?: PoolWebProxyProbeResult[]
+        error?: string
+      }
+      if (!response.ok || body.ok !== true) {
+        throw new Error(body.error ?? `HTTP ${response.status}`)
+      }
+      return body.results ?? []
+    } catch (cause: unknown) {
+      if (mounted.current) setError(cause instanceof Error ? cause.message : String(cause))
+      throw cause
+    } finally {
+      if (mounted.current) setProxyTestBusyId(undefined)
+    }
+  }
   const title = t?.('row.title') ?? 'XD Pool'
   const description = t?.('row.desc') ?? ''
   /**
@@ -1690,10 +1777,14 @@ export function PoolCard({ t, settingsScope }: PoolCardProps) {
                                     {...checkinBusyId === undefined ? {} : { checkinBusyId }}
                                     onClaimCheckin={(accountId) => { void claimCheckin(region, accountId) }}
                                     onSaveCreditReserve={(accountId, reserve) => saveCreditReserve(region, accountId, reserve)}
+                                    onSaveAccountProxies={(accountId, lines) => saveAccountProxies(region, accountId, lines)}
+                                    onTestAccountProxies={(accountId) => testAccountProxies(accountId)}
                                     onToggleDisabled={(accountId, disabled) => { void toggleAccountDisabled(region, accountId, disabled) }}
                                     onIgnoreAccount={(accountId) => { void setAccountIgnored(region, accountId, true) }}
                                     onPreferAccount={(accountId) => { void setPreferredAccount(region, accountId) }}
                                     {...accountBusyId === undefined ? {} : { accountBusyId }}
+                                    {...proxyBusy === undefined ? {} : { proxyBusyId: proxyBusy }}
+                                    {...proxyTestBusyId === undefined ? {} : { proxyTestBusyId }}
                                     t={t}
                                   />
                                 ))}
@@ -2003,6 +2094,10 @@ function AccountBlock({
   onPreferAccount,
   onSaveCreditReserve,
   reserveBusyId,
+  onSaveAccountProxies,
+  onTestAccountProxies,
+  proxyBusyId,
+  proxyTestBusyId,
   serving,
 }: {
   account: PoolWebAccount
@@ -2032,6 +2127,14 @@ function AccountBlock({
   onSaveCreditReserve: (accountId: string, reserve: number) => Promise<boolean>
   /** Account id whose reserve is being saved, if any. */
   reserveBusyId?: string
+  /** Persist this account's proxy list; true when the host confirmed the write. */
+  onSaveAccountProxies: (accountId: string, lines: string[]) => Promise<boolean>
+  /** Probe this account's proxies and report one reading per entry. */
+  onTestAccountProxies: (accountId: string) => Promise<PoolWebProxyProbeResult[]>
+  /** Account id whose proxy save is in flight, if any. */
+  proxyBusyId?: string
+  /** Account id whose proxy test is in flight, if any. */
+  proxyTestBusyId?: string
   /**
    * Is this the account the pool served its last request with?
    *
@@ -2189,6 +2292,17 @@ function AccountBlock({
           t={t}
           busy={reserveBusyId === account.id}
           onSave={onSaveCreditReserve}
+        />
+        {/* Outbound proxy IPs: one per line, tried top-down. Empty means this
+            account dials out directly, which is also how it comes back from a
+            proxy that stopped working. */}
+        <AccountProxyRow
+          account={account}
+          t={t}
+          busy={proxyBusyId === account.id}
+          testing={proxyTestBusyId === account.id}
+          onSave={onSaveAccountProxies}
+          onTest={onTestAccountProxies}
         />
         {/* What the automation got this account today, one line per source.
             Nothing is rendered when the automation earned nothing, rather than a
@@ -2362,6 +2476,167 @@ function CreditReserveRow({
             {t?.('row.reserveHolding') ?? 'Reserved: skipped'}
           </span>
         : null}
+    </div>
+  )
+}
+/**
+ * Per-account outbound proxy IPs.
+ *
+ * The pool's whole point is that accounts are interchangeable, but they are not
+ * interchangeable to the upstream: several accounts sharing one egress address
+ * look like one user, and the usual answer to that is a ban. Giving each
+ * account its own exit is the difference between a pool and a target.
+ *
+ * An EMPTY list is a first-class value, not a missing one — it means "this
+ * account dials out directly", which is both the default for a fresh account
+ * and the way back from a proxy that stopped working. So Save stays meaningful
+ * with nothing typed in it, and reports "cleared" rather than "saved".
+ *
+ * Order matters and is the user's, not ours: the chain is tried top-down, so
+ * the list is edited as text where line one is line one, rather than as chips
+ * that would have to be reordered by dragging.
+ */
+function AccountProxyRow({
+  account,
+  t,
+  busy,
+  testing,
+  onSave,
+  onTest,
+}: {
+  account: PoolWebAccount
+  t?: PoolCardProps['t']
+  busy: boolean
+  testing: boolean
+  /** Resolves true when the host confirmed the write, false otherwise. */
+  onSave: (accountId: string, lines: string[]) => Promise<boolean>
+  /** One reading per entry, in the order they were tried. */
+  onTest: (accountId: string) => Promise<PoolWebProxyProbeResult[]>
+}) {
+  const saved = account.proxies.join('\n')
+  const [draft, setDraft] = useState<string>(saved)
+  // The last confirmed state, so a successful save settles without waiting for
+  // the next poll and the button goes quiet immediately.
+  const [settled, setSettled] = useState<string>(saved)
+  const [note, setNote] = useState<'saved' | 'failed' | 'cleared' | undefined>(undefined)
+  const [probes, setProbes] = useState<readonly PoolWebProxyProbeResult[] | undefined>(undefined)
+  const [probeError, setProbeError] = useState<string | undefined>(undefined)
+  // Follow the host document when it changes underneath us — another tab, or a
+  // refresh after this card saved. Never mid-edit: that would overwrite typing.
+  useEffect(() => {
+    setSettled(saved)
+    setDraft(current => (current === saved ? current : saved))
+  }, [saved])
+  const dirty = draft !== settled
+  const lines = draft.split('\n').map(line => line.trim()).filter(line => line !== '')
+  const commit = async (): Promise<void> => {
+    if (busy || !dirty) return
+    setNote(undefined)
+    const ok = await onSave(account.id, lines)
+    setSettled(ok ? draft : settled)
+    setNote(ok ? (lines.length === 0 ? 'cleared' : 'saved') : 'failed')
+  }
+  const probe = async (): Promise<void> => {
+    if (testing) return
+    setProbes(undefined)
+    setProbeError(undefined)
+    try {
+      setProbes(await onTest(account.id))
+    } catch (cause: unknown) {
+      // The card-level line carries the reason; this keeps the row from
+      // silently looking like nothing happened.
+      setProbeError(cause instanceof Error ? cause.message : String(cause))
+    }
+  }
+  // One spare row so a trailing newline is visibly a new entry, and a ceiling
+  // so a long chain cannot push the rest of the account off the card.
+  const rows = Math.min(Math.max(lines.length + 1, 2), 6)
+  return (
+    <div className="dsm-xdpool-proxy">
+      <div className="dsm-xdpool-proxy-head">
+        <span className="dsm-xdpool-proxy-label">
+          {t?.('row.proxyTitle') ?? 'Proxy IPs'}
+        </span>
+        {account.proxyHealth === 'direct'
+          ? <span className="dsm-xdpool-proxy-badge" data-health="direct">
+              {t?.('row.proxyDirect') ?? 'Direct'}
+            </span>
+          : <span className="dsm-xdpool-proxy-badge" data-health={account.proxyHealth}>
+              {t?.('row.proxyActive', { count: account.proxyCount }) ?? `Proxy x${account.proxyCount}`}
+            </span>}
+      </div>
+      <textarea
+        className="dsm-xdpool-proxy-input"
+        value={draft}
+        rows={rows}
+        spellCheck={false}
+        disabled={busy}
+        placeholder={'http://user:pass@1.2.3.4:8080\nsocks5://user:pass@5.6.7.8:1080'}
+        aria-label={t?.('row.proxyTitle') ?? 'Proxy IPs'}
+        onChange={(event) => {
+          setDraft(event.target.value)
+          setNote(undefined)
+        }}
+        onKeyDown={(event) => {
+          // Enter stays a newline here — this is a list, not a one-line field.
+          // Ctrl/Cmd+Enter is the commit, the same chord a chat box uses.
+          if (event.key === 'Enter' && (event.ctrlKey || event.metaKey)) {
+            event.preventDefault()
+            void commit()
+          }
+        }}
+      />
+      <div className="dsm-xdpool-proxy-actions">
+        <button
+          type="button"
+          className="dsm-xdpool-proxy-save"
+          disabled={busy || !dirty}
+          onClick={() => { void commit() }}
+        >
+          {t?.('row.proxySave') ?? 'Save'}
+        </button>
+        <button
+          type="button"
+          className="dsm-xdpool-proxy-test"
+          disabled={testing || account.proxyCount === 0}
+          onClick={() => { void probe() }}
+        >
+          {t?.('row.proxyTest') ?? 'Test'}
+        </button>
+        {note === 'saved'
+          ? <span className="dsm-xdpool-proxy-note dsm-xdpool-proxy-note-ok">
+              {t?.('row.proxySaved') ?? 'Saved'}
+            </span>
+          : null}
+        {note === 'cleared'
+          ? <span className="dsm-xdpool-proxy-note dsm-xdpool-proxy-note-ok">
+              {t?.('row.proxyCleared') ?? 'Cleared - direct'}
+            </span>
+          : null}
+        {note === 'failed'
+          ? <span className="dsm-xdpool-proxy-note dsm-xdpool-proxy-note-bad">
+              {t?.('row.proxyFailed') ?? 'Not saved - try again'}
+            </span>
+          : null}
+      </div>
+      <p className="dsm-xdpool-proxy-hint">
+        {t?.('row.proxyHint') ?? 'One per line, top one first'}
+      </p>
+      {probeError === undefined ? null
+        : <span className="dsm-xdpool-proxy-probe dsm-xdpool-proxy-probe-bad">{probeError}</span>}
+      {probes === undefined ? null
+        : probes.map((reading, index) => (
+            <span
+              key={`${index}-${reading.proxy}`}
+              className={reading.ok
+                ? 'dsm-xdpool-proxy-probe dsm-xdpool-proxy-probe-ok'
+                : 'dsm-xdpool-proxy-probe dsm-xdpool-proxy-probe-bad'}
+            >
+              {reading.ok
+                ? `OK ${reading.latencyMs ?? 0}ms${reading.egressIp === undefined ? '' : ` · ${t?.('row.proxyEgress') ?? 'via'} ${reading.egressIp}`}`
+                : `FAIL ${reading.error ?? (reading.status === undefined ? 'error' : String(reading.status))}`}
+            </span>
+          ))}
     </div>
   )
 }
