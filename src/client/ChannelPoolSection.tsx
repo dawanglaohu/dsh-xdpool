@@ -31,7 +31,7 @@ import { useEffect, useRef, useState, type ReactElement } from 'react'
 import { BrandTile } from './brand-tile.tsx'
 import { channelIcon, channelInitials } from './channel-icons.ts'
 import { ModelFactsRow } from './model-facts-row.tsx'
-import { modelFactsFor, formatModelCapacity, type ModelFacts } from './model-facts.ts'
+import { contextWindowChoice, modelFactsFor, formatModelCapacity, type ModelFacts } from './model-facts.ts'
 import { recommendUse } from './recommend-use.ts'
 import {
   accountsFrom,
@@ -47,6 +47,10 @@ import {
   fetchChannels,
   modelsFrom,
   providerStatusesFrom,
+  resetResultFrom,
+  retestResultFrom,
+  type ChannelResetOutcome,
+  type ChannelRetestOutcome,
   setChannelModelContextBudget,
   sortChannelModels,
   type ChannelBalance,
@@ -156,6 +160,48 @@ function dedupeAccounts(accounts: readonly ChannelAccount[]): readonly ChannelAc
 /** A refusal shaped like the pack's own envelope, so one catch covers both. */
 function refused(message: string): ChannelRpcEnvelope {
   return { ok: false, error: { message } }
+}
+
+/**
+ * What one retest did, in a sentence the reader can act on.
+ *
+ * Three outcomes are worth telling apart, and the pack's own wording is kept for
+ * the failures because it carries the vendor's reset time:
+ *
+ * - nothing was marked, so nothing was probed (`tested === 0`) — the button is
+ *   not broken, there was simply no mark to re-check;
+ * - everything probed answered, so every mark is gone;
+ * - some still refused — those keep their mark and their vendor message.
+ */
+export function retestNotice(
+  outcome: ChannelRetestOutcome | undefined,
+  t: Translate | undefined,
+): string {
+  if (outcome === undefined) return t?.('channelpool.retestRefused') ?? 'Retest refused.'
+  if (outcome.error !== undefined) return outcome.error
+  if (outcome.tested === 0) return t?.('channelpool.retestNone') ?? 'No model was marked, so nothing was probed.'
+  if (outcome.stillLimited.length === 0) {
+    return t?.('channelpool.retestCleared', { count: outcome.cleared.length })
+      ?? `${outcome.cleared.length} model(s) answered again; their mark is gone.`
+  }
+  const first = outcome.stillLimited[0]
+  return t?.('channelpool.retestStillLimited', {
+    count: outcome.stillLimited.length,
+    message: first?.message ?? '',
+  }) ?? `${outcome.stillLimited.length} model(s) still limited: ${first?.message ?? ''}`
+}
+
+/** What one reset cleared. Zero is a real answer, not a failure. */
+export function resetNotice(
+  outcome: ChannelResetOutcome | undefined,
+  t: Translate | undefined,
+): string {
+  if (outcome === undefined) return t?.('channelpool.resetRefused') ?? 'Reset refused.'
+  if (outcome.clearedCount === 0) return t?.('channelpool.resetNone') ?? 'No rate-limit mark was recorded.'
+  return t?.('channelpool.resetDone', {
+    cleared: outcome.clearedCount,
+    accounts: outcome.accountCount,
+  }) ?? `Cleared ${outcome.clearedCount} mark(s) on ${outcome.accountCount} account(s).`
 }
 
 /**
@@ -538,10 +584,19 @@ export function ChannelPoolSection({ t }: { readonly t?: Translate | undefined }
     }
   }
 
+  /**
+   * The two rate-limit actions, dispatched through `accountAction`.
+   *
+   * `retest` re-probes only the models that carry a mark and clears the ones
+   * that answer again; `reset` deletes every mark without sending anything. They
+   * are separate buttons because they answer different questions — "is it really
+   * still limited?" versus "forget what we recorded" — and the pack keeps them
+   * separate for the same reason.
+   */
   const accountAction = async (
     provider: string,
     accountId: string,
-    action: 'refresh' | 'test' | 'toggle' | 'delete',
+    action: 'refresh' | 'test' | 'toggle' | 'delete' | 'retest' | 'reset',
   ): Promise<void> => {
     if (action === 'delete' && typeof window !== 'undefined') {
       const prompt = t?.('channelpool.deleteConfirm') ?? 'Remove this account?'
@@ -553,6 +608,8 @@ export function ChannelPoolSection({ t }: { readonly t?: Translate | undefined }
       const enabledNow = entry?.accounts.find(account => account.id === accountId)?.enabled !== false
       const method = action === 'refresh' ? 'account.refresh'
         : action === 'test' ? 'account.test'
+        : action === 'retest' ? 'account.retest'
+        : action === 'reset' ? 'account.reset'
         : action === 'delete' ? 'account.delete'
         : 'account.update'
       const payload = action === 'toggle'
@@ -564,7 +621,15 @@ export function ChannelPoolSection({ t }: { readonly t?: Translate | undefined }
         setNotice(envelope.error?.message ?? `${action} refused`)
         return
       }
-      if (action === 'test') setNotice(t?.('channelpool.testOk') ?? 'Reachable.')
+      if (action === 'test') {
+        setNotice(t?.('channelpool.testOk') ?? 'Reachable.')
+      } else if (action === 'retest') {
+        const outcome = retestResultFrom(envelope)
+        setNotice(retestNotice(outcome, t))
+      } else if (action === 'reset') {
+        const outcome = resetResultFrom(envelope)
+        setNotice(resetNotice(outcome, t))
+      }
       await load()
     } finally {
       if (mountedRef.current) markBusy(provider, false)
@@ -761,6 +826,24 @@ export function ChannelPoolSection({ t }: { readonly t?: Translate | undefined }
                             type="button"
                             className="dsm-xdpool-minibtn"
                             disabled={isBusy}
+                            title={t?.('channelpool.retestHint') ?? 'Probe the models that carry a rate-limit mark'}
+                            onClick={() => { void accountAction(channel.id, account.id, 'retest') }}
+                          >
+                            {t?.('channelpool.retestAccount') ?? 'Retest'}
+                          </button>
+                          <button
+                            type="button"
+                            className="dsm-xdpool-minibtn"
+                            disabled={isBusy}
+                            title={t?.('channelpool.resetHint') ?? 'Delete every rate-limit mark without sending a request'}
+                            onClick={() => { void accountAction(channel.id, account.id, 'reset') }}
+                          >
+                            {t?.('channelpool.resetAccount') ?? 'Clear marks'}
+                          </button>
+                          <button
+                            type="button"
+                            className="dsm-xdpool-minibtn"
+                            disabled={isBusy}
                             onClick={() => { void accountAction(channel.id, account.id, 'refresh') }}
                           >
                             {t?.('channelpool.refreshAccount') ?? 'Refresh'}
@@ -893,11 +976,12 @@ export function ChannelPoolSection({ t }: { readonly t?: Translate | undefined }
                           The native window is only ever different from the
                           advertised one when the user already capped this
                           model, and the picker needs both to render "full" next
-                          to "cap it".
+                          to "cap it". An absent cap means "not narrowed", which
+                          is served at the full native window — reading it as the
+                          conservative default left no radio selected for "full"
+                          and snapped every click back to the capped figure.
                         */
-                        const native = model.nativeContextWindow ?? model.contextWindow
-                        const capped = native !== undefined && native > CONTEXT_BUDGET_DEFAULT
-                        const budget = model.contextBudget ?? (capped ? CONTEXT_BUDGET_DEFAULT : native)
+                        const { native, capped, budget } = contextWindowChoice(model, CONTEXT_BUDGET_DEFAULT)
                         return (
                           <li key={model.id} className="dsm-xdpool-cpool-modelrow" data-off={!on}>
                             <label className="dsm-xdpool-cpool-modelrow-toggle">
@@ -934,7 +1018,7 @@ export function ChannelPoolSection({ t }: { readonly t?: Translate | undefined }
                                 {recuse}
                               </p>
                             )}
-                            {capped && (
+                            {capped && native !== undefined && (
                               <fieldset
                                 className="dsm-xdpool-model-budget dsm-xdpool-cpool-budget"
                                 aria-label={t?.('channelpool.modelBudget') ?? 'Context window'}

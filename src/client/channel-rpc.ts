@@ -743,6 +743,101 @@ export function claimResultFrom(envelope: ChannelRpcEnvelope): ChannelClaimResul
   }
 }
 
+/** One model the pack's retest could not clear, and what the vendor said. */
+export interface ChannelRetestStillLimited {
+  readonly modelId: string
+  readonly message: string
+}
+
+/**
+ * What one account's rate-limit retest actually did.
+ *
+ * The pack answers `account.retest` with `{accounts: [row], clearedCount}`, and
+ * `row.tested === 0` is a meaningful answer rather than an empty one: the pack
+ * only probes models that carry a mark, so an unmarked account is tested zero
+ * times and returns instantly. The card says so instead of printing a green
+ * tick for a request that never happened.
+ */
+export interface ChannelRetestOutcome {
+  readonly accountId: string
+  readonly nickname?: string | undefined
+  /** Models that carried a mark and were probed. Zero means there was none. */
+  readonly tested: number
+  /** Models that answered again and had their mark removed. */
+  readonly cleared: readonly string[]
+  /** Models still refused, with the vendor's own wording. */
+  readonly stillLimited: readonly ChannelRetestStillLimited[]
+  /** Set when the pack could not find the account at all. */
+  readonly error?: string | undefined
+}
+
+function retestStillLimitedFrom(value: unknown): ChannelRetestStillLimited | undefined {
+  if (value === null || typeof value !== 'object') return undefined
+  const row = value as Record<string, unknown>
+  const modelId = row['modelId']
+  if (typeof modelId !== 'string' || modelId === '') return undefined
+  const message = row['message']
+  return { modelId, message: typeof message === 'string' ? message : '' }
+}
+
+/** Read an `account.retest` answer, or `undefined` when the pack refused. */
+export function retestResultFrom(envelope: ChannelRpcEnvelope): ChannelRetestOutcome | undefined {
+  if (!envelope.ok) return undefined
+  const value = envelope.value
+  if (value === null || typeof value !== 'object') return undefined
+  const accounts = (value as { accounts?: unknown }).accounts
+  if (!Array.isArray(accounts)) return undefined
+  const first = accounts[0]
+  if (first === null || typeof first !== 'object') return undefined
+  const row = first as Record<string, unknown>
+  const accountId = row['accountId']
+  const tested = row['tested']
+  const cleared = row['cleared']
+  const stillLimited = row['stillLimited']
+  const error = row['error']
+  const nickname = row['nickname']
+  return {
+    accountId: typeof accountId === 'string' ? accountId : '',
+    ...typeof nickname === 'string' && nickname !== '' ? { nickname } : {},
+    tested: typeof tested === 'number' && Number.isFinite(tested) ? Math.trunc(tested) : 0,
+    cleared: Array.isArray(cleared)
+      ? cleared.filter((item): item is string => typeof item === 'string')
+      : [],
+    stillLimited: Array.isArray(stillLimited)
+      ? stillLimited
+        .map(retestStillLimitedFrom)
+        .filter((item): item is ChannelRetestStillLimited => item !== undefined)
+      : [],
+    ...typeof error === 'string' && error !== '' ? { error } : {},
+  }
+}
+
+/** What `account.reset` / `account.resetAll` cleared, per the pack's own count. */
+export interface ChannelResetOutcome {
+  readonly clearedCount: number
+  readonly accountCount: number
+}
+
+/**
+ * Read an `account.reset` answer.
+ *
+ * A reset sends no request — it deletes the marks and lets the next real call
+ * re-mark the model if the vendor still refuses. That is why the count is worth
+ * printing: zero cleared means there was nothing to clear, which is a different
+ * situation from "cleared it and it came back".
+ */
+export function resetResultFrom(envelope: ChannelRpcEnvelope): ChannelResetOutcome | undefined {
+  if (!envelope.ok) return undefined
+  const value = envelope.value
+  if (value === null || typeof value !== 'object') return undefined
+  const row = value as Record<string, unknown>
+  const count = (key: string): number => {
+    const raw = row[key]
+    return typeof raw === 'number' && Number.isFinite(raw) ? Math.trunc(raw) : 0
+  }
+  return { clearedCount: count('clearedCount'), accountCount: count('accountCount') }
+}
+
 /** Sum the balances the pack could actually read for one channel. */
 export function balancesTotal(balances: readonly ChannelBalance[]): number | undefined {
   let total = 0

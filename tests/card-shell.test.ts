@@ -223,7 +223,6 @@ describe('the shared per-model component', () => {
       'facts.textAndImage',
       'facts.textOnly',
       'facts.thinkingHint',
-      'facts.capped',
       'facts.test',
       'facts.testHint',
       'facts.testing',

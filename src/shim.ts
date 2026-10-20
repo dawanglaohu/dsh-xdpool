@@ -17,9 +17,9 @@ import { createHash, randomBytes, randomUUID, timingSafeEqual } from 'node:crypt
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
 import { Readable, Transform } from 'node:stream'
 import type { WorkBuddyAccount, WorkBuddyAccountPool, WorkBuddyCredential } from './accounts.ts'
-import type { WorkBuddyCatalog } from './catalog.ts'
+import type { WorkBuddyCatalog, WorkBuddyModelInfo } from './catalog.ts'
 import { parseRateLimitReset, WorkBuddyUpstreamClient, type ChatStreamResult, type UpstreamErrorKind, type WorkBuddyRegion } from './upstream.ts'
-import { compactWithSummary, estimateMessagesTokens, hardTruncate, type ChatMessage } from './context-budget.ts'
+import { compactWithSummary, estimateMessagesTokens, hardTruncate, repairToolPairing, type ChatMessage } from './context-budget.ts'
 import { AggregateError, forwardAggregateStreamed, resolveAggregateProvider, type AggregateCatalog } from './aggregate.ts'
 import { parseProviderModelId } from './providers.ts'
 import {
@@ -145,6 +145,8 @@ const KIND_STATUS: Readonly<Record<UpstreamErrorKind, number>> = {
   not_found: 502,
   server: 502,
   client: 400,
+  context_overflow: 400,
+  tool_pairing: 400,
 }
 function hostnameOfHost(host: string): string {
   let hostname = host.trim().toLowerCase()
@@ -184,14 +186,37 @@ function writeJson(res: ServerResponse, status: number, body: unknown): void {
 function writeOpenAIError(res: ServerResponse, status: number, kind: string, message: string): void {
   writeJson(res, status, { error: { message, type: kind, code: kind } })
 }
+/**
+ * Ceiling on the `max_tokens` the compaction summariser may ask for.
+ *
+ * The request is `floor(budget / 2)`, which on a 1M-token model asks for ~400k
+ * output tokens: far past what any model will emit, and the kind of number a
+ * gateway is entitled to reject outright. A summary is a briefing, not a
+ * document, so the ask is clamped to a size that can actually come back.
+ */
+const SUMMARISER_MAX_TOKENS = 65_536
 /** True when an upstream failure body means the request overran the model's
  *  context window (OpenAI `context_length_exceeded`, WorkBuddy code 11115 /
  *  "input length too long"). The shim answers it by compacting the conversation
- *  in place and retrying once; see `recoverFromContextOverrun`. */
-function isContextTooLong(body: string): boolean {
+ *  in place and retrying once; see `recoverFromContextOverrun`.
+ *
+ *  The live overflow body is
+ *  `{"code":11115,"msg":"prompt is too long: 1150035 tokens > 1048576 maximum"}`,
+ *  which matches NONE of the phrasings this gateway uses anywhere else — so every
+ *  wording seen in the field is listed rather than inferred from one pattern. A
+ *  miss here is not cosmetic: the failure falls through to a terminal class and
+ *  the turn dies instead of being compacted and retried. */
+export function isContextTooLong(body: string): boolean {
   if (body.includes('context_length_exceeded')) return true
   if (body.includes('input length too long')) return true
-  if (body.includes('"code":11115')) return true
+  // The business code, however the gateway spaces or quotes it: `"code":11115`,
+  // `"code": 11115`, `"code":"11115"`.
+  if (/"code"\s*:\s*"?\s*11115(?!\d)/u.test(body)) return true
+  if (body.includes('prompt is too long')) return true
+  if (body.includes('maximum context length')) return true
+  if (body.includes('prompt is too large')) return true
+  if (body.includes('too large for model')) return true
+  if (/context\s+(window|length)\s+exceeded/iu.test(body)) return true
   if (/exceeds?\s+(the\s+)?(model\s+)?context\s+(window|limit)/iu.test(body)) return true
   return false
 }
@@ -1147,7 +1172,13 @@ function withBareModelId(raw: string, modelId: string): string {
     // The two layers are complementary, not redundant: this one keeps a single
     // turn alive without the Harness ever seeing a failure, and the outer one
     // survives the case where a shim-side compaction still will not fit.
-    if (isContextTooLong(last.message)) {
+    // The classified kinds are the authoritative signal; the string predicate
+    // stays as the fallback for a body that no classifier recognised. Both mean
+    // "the prompt can be repaired", which is exactly what used to be missing:
+    // 11115 and 11148 fell through to `client` — terminal — so the shim gave up
+    // on a turn it could have salvaged.
+    const recoverable = last.kind === 'context_overflow' || last.kind === 'tool_pairing' || isContextTooLong(last.message)
+    if (recoverable) {
       const recovered = await recoverFromContextOverrun({
         raw,
         modelId,
@@ -1156,12 +1187,12 @@ function withBareModelId(raw: string, modelId: string): string {
         logger,
         client,
         pool,
+        catalog,
         maxAttempts,
         saturationDelays,
         usage: usageContext,
-        contextWindow: modelId === undefined
-          ? undefined
-          : catalog.current().find(m => m.id === modelId)?.contextWindow,
+        contextWindow: effectiveWindowOf(catalog, modelId),
+        reason: last.kind === 'tool_pairing' ? 'tool_pairing' : 'context_overflow',
       })
       if (recovered.ok) {
         await serveSuccessfulStream(res, recovered.account, recovered.result, logger, refreshBalance, pool, usageContext)
@@ -1395,11 +1426,23 @@ export interface RecoverOptions {
   logger: ShimLogger | undefined
   client: WorkBuddyUpstreamClient
   pool: WorkBuddyAccountPool
+  /** Consulted for the summariser's own output ceiling. */
+  catalog: WorkBuddyCatalog
   maxAttempts: number
   /** In-place saturation backoffs, shared with the main lane. */
   saturationDelays: readonly number[]
   /** True context window for the model, so the budget fits the real limit. */
   contextWindow?: number
+  /**
+   * Which failure opened this recovery.
+   *
+   * A broken tool-call/tool-result pairing (code 11148) is NOT an oversized
+   * prompt: halving the budget for it throws away half a conversation that
+   * already fitted, and the summariser call is wasted because the repair alone
+   * fixes it. Absent means the caller recognised the failure by its wording,
+   * which is the overflow path.
+   */
+  reason?: 'context_overflow' | 'tool_pairing'
   /**
    * Where this retry's calls are filed.
    *
@@ -1413,6 +1456,56 @@ export type RecoverResult =
   | { ok: true; account: WorkBuddyAccount; result: Extract<ChatStreamResult, { ok: true }> }
   | { ok: false; detail: string }
 /**
+ * The catalog row this model is ADVERTISED with, not the raw catalog value.
+ *
+ * `visible()` applies the user's per-model `contextBudgets` and drops disabled
+ * rows; `current()` is the unfiltered roster. Falls back to the raw roster for a
+ * model the user has DISABLED or a filter has dropped: recovery must still work
+ * for a request already in flight, and the unfiltered row is the closest honest
+ * answer left.
+ */
+function effectiveRowOf(catalog: WorkBuddyCatalog, modelId: string | undefined): WorkBuddyModelInfo | undefined {
+  if (modelId === undefined) return undefined
+  const find = (rows: readonly WorkBuddyModelInfo[]): WorkBuddyModelInfo | undefined =>
+    rows.find(model => model.id === modelId)
+  return find(catalog.visible()) ?? find(catalog.current())
+}
+/**
+ * The context window this model is ADVERTISED with, for the recovery budget.
+ *
+ * Two layers budget against the same number: the Harness compacts before
+ * dispatch using the window the adapter listed, and the recovery below picks its
+ * target from this helper. Reading `current()` — which ignores the user's
+ * per-model `contextBudgets` — let the two disagree, so a user who capped a model
+ * at 64K still got a recovery budget derived from the upstream's 1M and a
+ * "compacted" prompt the Harness had every reason to believe was far too large.
+ */
+export function effectiveWindowOf(
+  catalog: WorkBuddyCatalog,
+  modelId: string | undefined,
+): number | undefined {
+  return effectiveRowOf(catalog, modelId)?.contextWindow
+}
+/** {@link effectiveRowOf}'s output ceiling, for the summariser's `max_tokens`. */
+function effectiveMaxOutputOf(catalog: WorkBuddyCatalog, modelId: string | undefined): number | undefined {
+  return effectiveRowOf(catalog, modelId)?.maxOutputTokens
+}
+/**
+ * Drop the half-exchanges a head drop leaves behind, and say whether it changed.
+ *
+ * A prompt the upstream refused with code 11148 does not need to be SMALLER, it
+ * needs to be well-formed: `repairToolPairing` drops orphaned tool results and
+ * unsatisfied assistant `tool_calls`. Whether anything was actually dropped is
+ * reported so a repair that changes nothing is not mistaken for a fix — the
+ * retry would only be refused again.
+ */
+function recoverToolPairing(messages: readonly ChatMessage[]): { messages: ChatMessage[]; changed: boolean } {
+  const repaired = repairToolPairing(messages)
+  const changed = repaired.length !== messages.length
+    || repaired.some((message, index) => message !== messages[index])
+  return { messages: repaired, changed }
+}
+/**
  * Compact an over-long conversation and retry it once.
  *
  * Strategy, in order:
@@ -1424,7 +1517,7 @@ export type RecoverResult =
  * caller then surfaces the original actionable 400.
  */
 async function recoverFromContextOverrun(options: RecoverOptions): Promise<RecoverResult> {
-  const { raw, modelId, controller, region, logger, client, pool, maxAttempts, saturationDelays, usage } = options
+  const { raw, modelId, controller, region, logger, client, pool, catalog, maxAttempts, saturationDelays, usage, reason } = options
   const parsed = client.parseChatBody(raw)
   if (parsed === undefined) return { ok: false, detail: 'request body was not parseable JSON' }
   const rawMessages = parsed['messages']
@@ -1436,69 +1529,100 @@ async function recoverFromContextOverrun(options: RecoverOptions): Promise<Recov
   // The upstream reports the overrun but not the window size, so the budget has
   // to be derived from evidence rather than from the catalog alone.
   const overrunTokens = estimateMessagesTokens(messages)
-  // Use the model's REAL context window when known (from the catalog); only
-  // fall back to half the prompt when it is unknown.
+  // The target must sit below BOTH ceilings, and must be a genuine shrink in
+  // every case — a "compaction" that leaves the prompt the same size just buys a
+  // second identical 400.
   //
-  // …but NEVER trust it as an upper bound, which is the bug this fixes: the
-  // catalog advertises `deepseek-v4.1-flash` at 1M, so the budget computed to
-  // 0.8 * 1M - 2048 = 797952 while the rejected prompt was already 791793
-  // tokens. Compacting "to" a target LARGER than the prompt changed nothing, the
-  // retry overran again, and the log line looked like the recovery had run.
+  //  - the known WINDOW, less the reserve the model needs to answer in;
+  //  - the failing PROMPT itself, because it is the one size proven too big
+  //    whatever the catalog says.
   //
-  // The prompt in hand just overran, so it is a hard, EVIDENCE-BASED ceiling:
-  // whatever the catalog claims, the budget must sit meaningfully below it.
+  // With a known window, 80% of the prompt is kept rather than half: the window
+  // fraction already guarantees the shrink, and halving turned a 0.14% overrun on
+  // a 1M model into 500K tokens of conversation deleted for nothing. Only when
+  // the window is unknown is halving the prompt the sole evidence available.
   const realWindow = options.contextWindow
-  const fromWindow = realWindow !== undefined && realWindow > 0
-    ? Math.max(512, Math.floor(realWindow * 0.8) - 2048)
-    : Number.POSITIVE_INFINITY
-  // Half the failing prompt: its size is known to be too big, so halving it both
-  // guarantees real shrinkage and leaves headroom for the answer.
-  const fromOverrun = Math.max(512, Math.floor(overrunTokens / 2))
+  const knownWindow = realWindow !== undefined && realWindow > 0
+  const fromWindow = knownWindow ? Math.max(512, Math.floor(realWindow * 0.8) - 2048) : Number.POSITIVE_INFINITY
+  // Evidence-based shrink: when the window is known the window fraction already
+  // guarantees a shrink, so keep 80% of the failing prompt instead of half.
+  const fromOverrun = Math.max(512, Math.floor(overrunTokens * (knownWindow ? 0.8 : 0.5)))
   const budget = Math.min(fromWindow, fromOverrun)
-  logger?.warn(
-    `dsh-xdpool: context overrun on ${modelId ?? '(no model)'} `
-      + `(~${overrunTokens} tokens, catalog window ${realWindow ?? 'unknown'}); `
-      + `compacting to ~${budget} and retrying once`,
-  )
   let summary: string | undefined
   let compacted: ChatMessage[] = messages
   let compactionDetail = ''
-  try {
-    const summariser = await pool.acquire(modelId, region)
-    if (summariser === undefined) {
-      compactionDetail = 'no account available to summarise with'
-    } else {
-      const outcome = await compactWithSummary(
-        messages,
-        { budget, keepRecent: 6 },
-        {
-          complete: async (request, signal) => {
-            const body = client.buildChatBody(
-              { ...parsed, stream: true, max_tokens: Math.max(256, Math.floor(budget / 2)) },
-              request,
-            )
-            return await client.completeChat(summariser.credential, body, signal ?? controller.signal)
-          },
-        },
-        controller.signal,
-      )
-      compacted = outcome.messages
-      summary = outcome.summary
-      if (outcome.skipped !== undefined) compactionDetail = outcome.skipped
+  if (reason === 'tool_pairing') {
+    // Code 11148 means the transcript is MALFORMED, not oversized: a head drop
+    // left a tool result without its call, or a call without its result. The
+    // prompt already fits, so compacting it would discard good history and the
+    // summariser call would not touch the one thing the upstream objected to.
+    // Repair first; only shrink if the repaired prompt is over the budget anyway.
+    const repaired = recoverToolPairing(messages)
+    if (!repaired.changed) {
+      return { ok: false, detail: 'tool calls and tool results do not match, and no orphaned half could be found' }
     }
-  } catch (error: unknown) {
-    // Summarisation is best-effort; fall through to truncation.
-    compactionDetail = `summarisation failed: ${String(error)}`
+    compacted = repaired.messages
+    logger?.warn(
+      `dsh-xdpool: tool-call pairing broken on ${modelId ?? '(no model)'} `
+        + `(${messages.length - compacted.length} message(s) dropped); retrying once without compacting`,
+    )
+    if (estimateMessagesTokens(compacted) > budget) {
+      compacted = hardTruncate(compacted, budget).messages
+    }
+  } else {
+    logger?.warn(
+      `dsh-xdpool: context overrun on ${modelId ?? '(no model)'} `
+        + `(~${overrunTokens} tokens, catalog window ${realWindow ?? 'unknown'}); `
+        + `compacting to ~${budget} and retrying once`,
+    )
+    try {
+      const summariser = await pool.acquire(modelId, region)
+      if (summariser === undefined) {
+        compactionDetail = 'no account available to summarise with'
+      } else {
+        // A summary is a briefing, so it never needs a window-sized answer: the
+        // ask is capped by the summariser's own output limit AND by an absolute
+        // ceiling, because `budget / 2` on a 1M model requested ~400k tokens.
+        const summariserCap = Math.min(
+          SUMMARISER_MAX_TOKENS,
+          effectiveMaxOutputOf(catalog, modelId) ?? SUMMARISER_MAX_TOKENS,
+        )
+        const outcome = await compactWithSummary(
+          messages,
+          { budget, keepRecent: 6 },
+          {
+            complete: async (request, signal) => {
+              const body = client.buildChatBody(
+                { ...parsed, stream: true, max_tokens: Math.min(Math.max(256, Math.floor(budget / 2)), summariserCap) },
+                request,
+              )
+              return await client.completeChat(summariser.credential, body, signal ?? controller.signal)
+            },
+          },
+          controller.signal,
+        )
+        compacted = outcome.messages
+        summary = outcome.summary
+        if (outcome.skipped !== undefined) compactionDetail = outcome.skipped
+      }
+    } catch (error: unknown) {
+      // Summarisation is best-effort; fall through to truncation.
+      compactionDetail = `summarisation failed: ${String(error)}`
+    }
+    // Whatever the summariser managed, make sure the prompt now fits.
+    if (estimateMessagesTokens(compacted) > budget) {
+      compacted = hardTruncate(compacted, budget).messages
+    }
+    if (summary === undefined && estimateMessagesTokens(compacted) >= overrunTokens) {
+      return { ok: false, detail: compactionDetail === '' ? 'compaction could not reduce the prompt' : compactionDetail }
+    }
   }
-  // Whatever the summariser managed, make sure the prompt now fits.
-  if (estimateMessagesTokens(compacted) > budget) {
-    compacted = hardTruncate(compacted, budget).messages
-  }
-  if (summary === undefined && estimateMessagesTokens(compacted) >= overrunTokens) {
-    return { ok: false, detail: compactionDetail === '' ? 'compaction could not reduce the prompt' : compactionDetail }
-  }
-  const retryBody = client.buildChatBody(parsed, compacted)
+  let retryBody = client.buildChatBody(parsed, compacted)
   const tried: string[] = []
+  // One pairing repair per recovery. A transcript the repair cannot fix is
+  // malformed in a way this shim has no answer for, and retrying it forever would
+  // spend the whole account budget re-sending the same rejected prompt.
+  let repairedPairing = reason === 'tool_pairing'
   for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
     if (controller.signal.aborted) return { ok: false, detail: 'client disconnected' }
     const account = await pool.acquire(modelId, region)
@@ -1529,14 +1653,36 @@ async function recoverFromContextOverrun(options: RecoverOptions): Promise<Recov
     }
     if (result.ok) {
       logger?.info?.(
-        `dsh-xdpool: recovered from context overrun on ${modelId ?? '(no model)'} `
-          + `(summarised: ${summary === undefined ? 'no' : 'yes'})`,
+        reason === 'tool_pairing'
+          ? `dsh-xdpool: recovered from a broken tool-call pairing on ${modelId ?? '(no model)'}`
+          : `dsh-xdpool: recovered from context overrun on ${modelId ?? '(no model)'} `
+            + `(summarised: ${summary === undefined ? 'no' : 'yes'})`,
       )
       return { ok: true, account, result }
     }
-    if (isContextTooLong(result.message)) {
+    if (isContextTooLong(result.message) || result.kind === 'context_overflow') {
       // Still too long even after compaction: give up rather than loop.
       return { ok: false, detail: 'prompt still exceeded the window after compaction' }
+    }
+    if (result.kind === 'tool_pairing') {
+      // The repair either was not needed or did not go far enough. Try it once on
+      // the CURRENT array — the prompt has been rewritten since the entry point,
+      // so there may be a fresh half-exchange to drop — and then stop: a second
+      // 11148 means the malformation is one this repair does not model.
+      if (!repairedPairing) {
+        repairedPairing = true
+        const repaired = recoverToolPairing(compacted)
+        if (repaired.changed) {
+          compacted = repaired.messages
+          retryBody = client.buildChatBody(parsed, compacted)
+          logger?.warn(
+            `dsh-xdpool: tool-call pairing still broken on ${modelId ?? '(no model)'} `
+              + `after compaction (${compacted.length} message(s) left); repairing and retrying once`,
+          )
+          continue
+        }
+      }
+      return { ok: false, detail: `upstream ${result.kind} after compaction` }
     }
     if (result.kind === 'session_dead') {
       // Same rule as the main loop: try a refresh, and if the credential is

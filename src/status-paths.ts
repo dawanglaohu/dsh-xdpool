@@ -350,7 +350,9 @@ export const CHANNEL_PACK_RPC_PATH = '/api/channel-pack'
  *   accounts, `model.list` for the catalogue, `model.setDisabled` for a single
  *   toggle, `model.setAllDisabled` for the two bulk buttons.
  * - Per account: `account.test`, `account.refresh`, `account.update` to pause a
- *   sign-in, `account.delete` to remove it.
+ *   sign-in, `account.delete` to remove it, and the two rate-limit actions —
+ *   `account.retest` to re-probe the marked models and `account.reset` to delete
+ *   the marks without sending anything.
  * - Credits: `credits.balances` for the balance, `credits.status` for today's
  *   check-in badge, `credits.claimAll` for the claim button, and
  *   `usage.autoCheckin` for the one global automatic-claim switch.
@@ -360,7 +362,7 @@ export const CHANNEL_PACK_RPC_PATH = '/api/channel-pack'
  * runtime rejects a method outside this set. A test asserts that every
  * `callPack` call site in src/client is named here, which is what keeps the
  * list honest — widen it deliberately, never silently. Note the test only sees
- * literal `callPack('…')` sites, so the four account methods dispatched through
+ * literal `callPack('…')` sites, so the six account methods dispatched through
  * a computed `method` variable in ChannelPoolSection's `accountAction` are
  * listed here by hand and would not fail a test if a caller dropped them.
  */
@@ -369,6 +371,8 @@ export const CHANNEL_PACK_METHODS: ReadonlySet<string> = new Set([
   'account.delete',
   'account.list',
   'account.refresh',
+  'account.reset',
+  'account.retest',
   'account.test',
   'account.update',
   'credits.balances',

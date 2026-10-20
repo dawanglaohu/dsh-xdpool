@@ -44,7 +44,6 @@ export type ModelFactsKey =
   | 'facts.textAndImage'
   | 'facts.textOnly'
   | 'facts.thinkingHint'
-  | 'facts.capped'
   | 'facts.test'
   | 'facts.testHint'
   | 'facts.testing'
@@ -104,14 +103,31 @@ export interface ModelFacts {
 }
 
 /**
- * The pool's own serving cap on a context window.
+ * How a model row's context-window picker resolves.
  *
- * This is the number the account-pool lane actually advertises to DSH, so a
- * model whose published window is larger is served with this one. It is stated
- * here rather than imported from the pool's Node-only catalog module, because
- * the browser half must not pull in `node:fs`.
+ * The pack only sends `nativeContextWindow` once the user has already narrowed
+ * that model, and only sends `contextBudget` when a cap exists at all: an absent
+ * cap means "not narrowed", which is served with the full native window. Reading
+ * that absence as the conservative default would show a 1M model as capped at
+ * 200K, and then neither radio in the picker could ever come up selected for the
+ * full window — the click would write a cap, reload, and snap back.
+ *
+ * `capped` is only about whether a picker has anything to offer: a model whose
+ * window does not exceed the default has nothing to choose between.
  */
-export const MODEL_CONTEXT_CAP = 131_072
+export function contextWindowChoice(
+  model: {
+    readonly nativeContextWindow?: number | undefined
+    readonly contextWindow?: number | undefined
+    readonly contextBudget?: number | undefined
+  },
+  defaultBudget: number,
+): { readonly native: number | undefined; readonly capped: boolean; readonly budget: number | undefined } {
+  const native = model.nativeContextWindow ?? model.contextWindow
+  const capped = native !== undefined && native > defaultBudget
+  const budget = model.contextBudget ?? native
+  return { native, capped, budget }
+}
 
 /** A raw number a model row may carry, narrowed to something printable. */
 function capacityOf(value: unknown): number | undefined {
@@ -193,27 +209,26 @@ export function formatModelCapacity(value: number): string {
 /**
  * One model's line of figures, already resolved for printing.
  *
- * `capped` is the single inference in this module and it is about our own
- * number, not the model's: when the published window exceeds the cap the pool
- * lane enforces, the row says so rather than implying the model can actually
- * take that many tokens.
+ * The context figure is the window the model publishes, printed as published.
+ * This module used to clamp anything above 131 072 down to that number on the
+ * theory that the account-pool lane served nothing larger; it does — the lane
+ * passes `contextWindow` through untouched and the catalogue declares 1M for
+ * whole families of models — so clamping printed "131K" next to a model the
+ * picker right beside it offered at 1M.
  */
 export function modelFigureLine(facts: ModelFacts): {
   context?: string
   output?: string
   vision?: 'text' | 'both'
   efforts?: string
-  capped: boolean
 } {
-  const capped = facts.contextWindow !== undefined && facts.contextWindow > MODEL_CONTEXT_CAP
   const out: {
     context?: string
     output?: string
     vision?: 'text' | 'both'
     efforts?: string
-    capped: boolean
-  } = { capped }
-  if (facts.contextWindow !== undefined) out.context = formatModelCapacity(capped ? MODEL_CONTEXT_CAP : facts.contextWindow)
+  } = {}
+  if (facts.contextWindow !== undefined) out.context = formatModelCapacity(facts.contextWindow)
   if (facts.maxOutputTokens !== undefined) out.output = formatModelCapacity(facts.maxOutputTokens)
   if (facts.vision !== undefined) out.vision = facts.vision ? 'both' : 'text'
   if (facts.supportedEfforts !== undefined) out.efforts = facts.supportedEfforts.join(' / ')

@@ -113,6 +113,104 @@ function isPinnedRole(role: string): boolean {
   return role === 'system' || role === 'developer'
 }
 
+/** Tool-call entries of a message, tolerating a bare object in place of an array. */
+function toolCallEntries(value: unknown): unknown[] {
+  if (Array.isArray(value)) return value
+  if (value === null || value === undefined) return []
+  return [value]
+}
+
+/** The id of one tool-call entry, or undefined when it carries none. */
+function toolCallId(entry: unknown): string | undefined {
+  if (typeof entry !== 'object' || entry === null) return undefined
+  const id = (entry as Record<string, unknown>)['id']
+  return typeof id === 'string' && id !== '' ? id : undefined
+}
+
+/**
+ * Rebuild a message array so that every tool call and tool result still pairs.
+ *
+ * Cutting a conversation from the front can slice a tool exchange in half: a
+ * `tool` result survives while the assistant message that declared its
+ * `tool_call_id` is gone, or an assistant `tool_calls` outlives the result it
+ * was waiting for. The upstream rejects such a prompt outright ("tool calls and
+ * tool results do not match"), so every head-drop path runs its survivors
+ * through here before they go back on the wire.
+ *
+ * A `tool` message survives only when an assistant message earlier in the array
+ * declared its `tool_call_id`; an assistant message survives only when at least
+ * one of its declared calls is answered by a later `tool` message, and its
+ * `tool_calls` are narrowed to the answered ids. An assistant turn that existed
+ * solely to call tools is unusable once every call is unanswered, so it goes
+ * even when it still has text. Pinned instructions are never dropped, and
+ * survivors keep their identity and their relative order.
+ */
+export function repairToolPairing(messages: readonly ChatMessage[]): ChatMessage[] {
+  const declared = new Set<string>()
+  const kept: ChatMessage[] = []
+  let changed = false
+
+  for (const message of messages) {
+    if (message.role === 'tool') {
+      const id = message['tool_call_id']
+      if (typeof id !== 'string' || !declared.has(id)) {
+        changed = true
+        continue
+      }
+      kept.push(message)
+      continue
+    }
+    if (message.role === 'assistant') {
+      for (const entry of toolCallEntries(message['tool_calls'])) {
+        const id = toolCallId(entry)
+        if (id !== undefined) declared.add(id)
+      }
+    }
+    kept.push(message)
+  }
+
+  const answered = new Set<string>()
+  const repaired: ChatMessage[] = []
+  for (let index = kept.length - 1; index >= 0; index -= 1) {
+    const message = kept[index]
+    if (message === undefined) continue
+    if (message.role === 'tool') {
+      const id = message['tool_call_id']
+      if (typeof id === 'string') answered.add(id)
+      repaired.push(message)
+      continue
+    }
+    // Pinned instructions never carry tool calls in practice; the guard keeps the
+    // function total for a malformed prompt that puts tool_calls on a system turn.
+    if (isPinnedRole(message.role) || message.role !== 'assistant') {
+      repaired.push(message)
+      continue
+    }
+    const entries = toolCallEntries(message['tool_calls'])
+    if (entries.length === 0) {
+      repaired.push(message)
+      continue
+    }
+    const live = entries.filter(entry => {
+      const id = toolCallId(entry)
+      return id !== undefined && answered.has(id)
+    })
+    if (live.length === 0) {
+      changed = true
+      continue
+    }
+    if (live.length === entries.length) {
+      repaired.push(message)
+      continue
+    }
+    changed = true
+    repaired.push({ ...message, tool_calls: live })
+  }
+
+  if (!changed) return messages as ChatMessage[]
+  return repaired.reverse()
+}
+
 export interface CompactOptions {
   /**
    * Token budget for the prompt. The reserve for the model's own output is
@@ -148,7 +246,8 @@ export function compactMessages(
   const keepRecent = Math.max(1, options.keepRecent ?? 4)
   const estimate = estimateMessagesTokens(messages)
   if (estimate <= options.budget) {
-    return { messages: [...messages], dropped: [], tokens: estimate, changed: false }
+    const untouched = repairToolPairing([...messages])
+    return { messages: untouched, dropped: [], tokens: estimateMessagesTokens(untouched), changed: false }
   }
 
   const pinned: ChatMessage[] = []
@@ -178,11 +277,14 @@ export function compactMessages(
 
   // Summarisation input is exactly the prefix trimmed away.
   const dropped = head.slice(0, dropCount)
+  // `dropped` stays the contiguous prefix above; only the survivors are repaired,
+  // so a cut that lands inside a tool exchange cannot leave an unpaired call behind.
+  const kept = repairToolPairing(candidate)
 
   return {
-    messages: candidate,
+    messages: kept,
     dropped,
-    tokens: total,
+    tokens: estimateMessagesTokens(kept),
     changed: dropCount > 0,
   }
 }
@@ -206,10 +308,11 @@ export function hardTruncate(
     candidate = messages.slice(start)
     total = estimateMessagesTokens(candidate)
   }
+  const kept = repairToolPairing(candidate)
   return {
-    messages: candidate,
+    messages: kept,
     dropped: messages.slice(0, start),
-    tokens: total,
+    tokens: estimateMessagesTokens(kept),
     changed: start > 0,
   }
 }
@@ -366,5 +469,5 @@ function injectSummary(compacted: readonly ChatMessage[], summary: string): Chat
     if (isPinnedRole(message.role)) pinned.push(message)
     else rest.push(message)
   }
-  return [...pinned, summaryMessage(summary), ...rest]
+  return repairToolPairing([...pinned, summaryMessage(summary), ...rest])
 }

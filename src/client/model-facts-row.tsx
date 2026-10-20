@@ -1,8 +1,6 @@
 import type { ReactElement } from 'react'
 
 import {
-  formatModelCapacity,
-  MODEL_CONTEXT_CAP,
   modelFigureLine,
   modelFactsFor,
   type ModelFacts,
@@ -30,9 +28,10 @@ import {
  * Only what an upstream published: context window, output ceiling, whether the
  * model takes images, and the thinking levels it names. A field nobody
  * published is omitted entirely rather than filled with a plausible guess —
- * see {@link modelFactsFor} for why that rule exists. The one inference, a
- * window above the pool's own {@link MODEL_CONTEXT_CAP}, is labelled as capped
- * because that cap is a number this plugin chose and can therefore prove.
+ * see {@link modelFactsFor} for why that rule exists. There is no inference
+ * left in the printed numbers: a window is printed at the size the model
+ * publishes it, because clamping it to a smaller number this module invented
+ * made a 1M model read "131K" while the picker next to it offered 1M.
  *
  * The row renders nothing at all when nothing is known, which is the honest
  * outcome for the majority of registry rows: 456 of 504 carry no window, and
@@ -150,18 +149,7 @@ export function ModelFactsRow({ row, t, className, facts, onTest, probe, probing
       {hasFigures || onTest !== undefined || probe !== undefined
         ? <div className="dsm-xdpool-mfacts-line">
             {figures.context === undefined ? null
-              : <Figure
-                  label={say('facts.context', 'context')}
-                  value={figures.context}
-                  {...(figures.capped && resolved.contextWindow !== undefined
-                    ? {
-                        title: say('facts.capped', 'capped by this pool', {
-                          served: figures.context ?? '',
-                          published: formatModelCapacity(resolved.contextWindow),
-                        }),
-                      }
-                    : {})}
-                />}
+              : <Figure label={say('facts.context', 'context')} value={figures.context} />}
             {figures.output === undefined ? null
               : <Figure label={say('facts.output', 'out')} value={figures.output} />}
             {figures.vision === undefined ? null
