@@ -1,15 +1,17 @@
 # Changelog
 本项目的所有重要变更都会记录在此文件。
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
-## 未发布 — 每个账号一个出口 IP
+## 2.4.0 — 每个账号一个出口 IP，Qoder 账号环境隔离
+> 这一版收掉两件同源的事：池里的账号在上游看来不再共享同一个来源 —— 出口 IP 可以逐账号配，Qoder 的机器身份也逐账号独立。前者的底线是「宁可失败也不回退直连」，后者撞上的是 Qoder 服务端 6 个机器身份槽位的物理上限。
+### 每个账号一个出口 IP
 > 一个插件里跑五六个 WorkBuddy 账号，全部从本机同一个公网 IP 出去 —— 上游看到的是同一个来源，风控上等于一个账号在多开，号越多越像。现在每个号可以有自己的出口，并且**挂了也不许偷偷回退直连**。
-### 现象
+#### 现象
 池子里账号越多，这件事越刺眼：所有请求都从这台机器出去，出口 IP 是同一个。对上游来说「六个账号」和「一个账号开六份」在来源上没有任何区别，而池子的全部意义正是让它们看起来是六个独立用户。有人已经在代理软件里给整台机器挂了全局代理，代价是所有账号又被塞回同一个 IP——绕了一圈回到原点。
-### 根因：出站请求是 `fetch` 直发，没有可插入的出口层
+#### 根因：出站请求是 `fetch` 直发，没有可插入的出口层
 两条路都不通：`globalThis.fetch` 没有办法说「这一趟从那个 SOCKS5 出去」，教它这么做的正道是 undici dispatcher，而那是 npm 依赖（本插件一个都不带）；整机全局代理则把「逐账号」这个前提直接抹掉了。
 
 更要紧的是**覆盖率**：只要有一处出站忘记走代理，那个请求就带着真实 IP 出去。所以「大部分走代理」等于没做——功能要么覆盖每一个出站请求，要么就只是给了个心理安慰。
-### 修法
+#### 修法
 - 新增 `proxy-fetch.ts`：出站代理传输，手写 `node:http` / `node:https` + RFC1928/1929（仓库里 `free-upstream.ts` 的 `freeFetch` 已经是这个形状，保持「出站只有一种写法」）。三条路径：明文目标走 absolute-form 请求行、HTTPS 目标走 CONNECT 后隧道内 TLS、SOCKS5 走握手后同样两种情况。
 - 失败策略写成表而不是靠判断：TCP 拨号 / CONNECT 隧道 / 隧道超时 / SOCKS5 方法或认证 / SOCKS5 REP / 隧道内 TLS，逐类落到 `connect` / `tunnel` / `timeout` / `auth` / `socks` / `tls`。**响应头一到就返回，任何状态码都不重试**——重试会让 shim 拿一个无法归因到账号的信号去做冷却和轮换决策。
 - `sendViaProxies()` 实现有序备选链：数组第 0 项是主出口，后面的按顺序顶替。**链上每一跳都失败时抛 `ProxyChainError`**（报文 `every proxy failed: <已脱敏的代理> connect <原因>`），绝不回退直连——静默回退正是封号场景。
@@ -29,17 +31,37 @@
 - 账号健康徽标只看「链是否存在」，不持久化上次探测判决——否则代理修好之后卡片还会一直显示失败。实时答案属于自检按钮。
 - 聚合车道（`aggregate.ts`）里用户自己配的聚合 provider 保持直连：那是用户自配的第三方服务，不是池里的 WorkBuddy 账号。
 - 新增 5 个测试文件（传输、失败转移、存储、路由、卡片），钉住上面每一条：不回退直连、响应头后不重试、流式 body 不重放、熔断窗口、脱敏与掩码回存、空链不落盘、宽容读取、两条路由的 400/403。
-## 未发布 — 安装源改回本仓库
+### Qoder 多账号机器身份隔离（登录 B 账号后签不上到）
+> 登录 A 账号签到正常，再登录 B 账号，B 就永远领不到积分 —— 界面上只留一句「该账号尚未在 Qoder 侧开通每日领取」。池子把两个账号伪装成了同一台机器，Qoder 服务端认得出。
+#### 现象
+先登录 A，`credits.claimAll` 能领到；再登录 B，B 的领取永远返回「没有可领的活动」，`/sash/api/v2/me/usage` 里 `qoderUsage.addOnQuota` 整块缺失，插件据此判定 `isQoderNotActivated`，给出「请先用 Qoder 官方客户端登录一次该账号」的提示 —— 而 B 明明刚登录过。
+#### 根因：机器身份是全局单例，而且硬编码在一个槽位上
+`pack.js` 调 `runtime-info.exe` 取机器身份时，`RUNTIME_INFO_ENVIRONMENT` 被写死成 `"3"`，取回的结果又存进模块级单例 `cached2`。于是池里所有 Qoder 账号共用同一份 `Cosy-MachineToken` / `Cosy-MachineType` / `Cosy-MachineCode`。
+
+Qoder 服务端按 **(uid, 机器身份)** 判定活动资格。A 先用这份身份占住了活动，B 拿着同一份身份上来，服务端不给 B 下发 `CLAIM_BENEFIT`，`addOnQuota` 也一并缺失。请求头补得再全（`Cosy-Version`、`Cosy-MachineOS` / `Cosy-MachineHostname` / `Cosy-MachineId` / `Cosy-MachineCode`、凭据里的 `machine_id`）都不影响判决 —— 实测只有机器身份本身能改结果。
+
+`runtime-info.exe` 的 `environment` 参数实测在 0..120 范围内只有 **6 个有效槽位**：`0` / `3` / `4` / `5` / `6` / `7`，各自产出一份确定但互不相同的机器身份（其余取值一律 `sgsdk init callback reported error code 6` 或 `code 2`）。也就是说 Qoder 家族同一时间最多只能有 6 个互不相同的账号 —— 这是服务端的物理上限，代码绕不过去。
+#### 修法
+- 机器身份缓存从单例改成按槽位的 `Map`；`runtimeInfoArgs(slot)` / `readFromRuntimeInfoAsync(override, slot)` / `resolveQoderMachineIdentityAsync(forceExecutable, slot)` 全部参数化。
+- 凭据新增 `machine_slot` 字段，随 `buildQoderCredential` / `applyQoderRefresh` 一起写入与透传；`creditsHeaders` 按凭据自己的槽位取机器身份。
+- 登录时为新账号分配一个未被占用的槽位：`collectQoderUsedMachineSlots` 扫占用表 → `allocateQoderMachineSlotAsync` 挑第一个可用槽位 → 写进 `flowOptions.machineSlot`，再走 `persistLogin` 落盘。`account.create` 在 `pool.addAccount` **之前**分配，槽位拿不到就直接失败，不留半截账号。
+- 占用表按产品族查：`QODER_MACHINE_SLOT_PRODUCT_IDS = ["qoder", "qodercn"]`。国际版与国内版共用同一份 `runtime-info` 身份池，各自从 `"0"` 数起必然撞车。
+- 槽位耗尽不再静默撞车：`ensureQoderMachineSlotAsync` 找不到空槽时抛 `qoder-machine-slot-exhausted`，文案直说「Qoder 的机器身份槽位已用尽（6 个），请先删除一个已不需要的 Qoder 账号」。
+- 没有 `machine_slot` 的凭据**不注入任何** `Cosy-Machine*` 头。旧行为是 `normalizeQoderMachineSlot` 兜底返回 `"3"`，等于让一个来路不明的凭据冒用 A 的机器身份 —— 那正是原缺陷本身。
+- 旧凭据自动迁移 `migrateQoderMachineSlots`：先让无槽位的账号认领历史槽位 `"3"`（那里本来就是它们用过的身份），再给剩下的找空闲可用槽位，最后给「有槽位却领不到活动」的账号自愈重分配。三轮共享同一份 `taken` 池，跨产品一起算。
+- 顺带把这条车道的风控短板补上：`qoderFetchWithRetry` 对 429 / 408 / 5xx 与网络异常重试 3 次（读 `Retry-After`，退避 600ms 起、上限 8s，**响应头一到就不再重试**）；账号之间加 1.2s ± 0.6s 抖动节流；`describeNonJson` 改成从真实错误体里取 `errorCode` / `errorMessage` / `requestId`，401 / 403 / 400 / 404 / 429 各有专门文案，不再把整段 JSON 原样甩给用户。
+- `credits.status` 补上 Qoder 分支：Qoder 家族没有独立的签到状态接口，资格只体现在 campaigns 的 `claimStatus` 上，所以这里返回 `status: null`，不编一个状态出来。
+### 安装源改回本仓库
 > 这个 fork 修了两个上游还没修的问题，但 README 的首选安装方式仍然指向 npm 上的上游包 —— 照着装的人拿到的是没有这些修复的版本。
-### 改动
+#### 改动
 - 安装源改为 `github:dawanglaohu/dsh-xdpool`（README 两种语言的首选方式）。`lib/` 构建产物本来就随仓库提交，所以 GitHub 安装不需要任何安装期脚本。
 - npm 方式降为次选，并明确标注：npm 上的 `dsh-xdpool` 归上游维护者，只发上游代码，不含本仓库的修复。
 - `package.json` 的 `homepage` / `bugs` / `repository` 与客户端卡片右上角的 Star 链接都指向本仓库；`author` 保持上游 `XDTrees` 不变，`LICENSE` 在原始版权声明之后追加一行 fork 维护者 `dawanglaohu`（MIT 要求保留原始声明，不能替换）。
 - `.github/workflows/README.md` 里 npm Trusted Publisher 表单的 `Organization or user` 改为 `dawanglaohu`（必须与仓库 owner 一致，否则 OIDC 发布失败）；`release.yml` 注释里那句「历史 Release 都是维护者本人身份（XDTrees）」改为不点名，因为这个仓库的维护者不是上游作者。
 - 顶部徽章：新增「install source: GitHub」指向本仓库，npm 版本徽章降级标注为 `npm (upstream)`。
-## 未发布 — 模型饱和不再被当成账号限流
+### 模型饱和不再被当成账号限流
 > 一次「越换号越没得用」的雪崩：上游说「这个模型现在忙」，池子理解成「这个账号超限了」，于是把一个跟账号毫无关系的短暂拥堵，冷却成了整池一分钟不可用。
-### 现象
+#### 现象
 选 `deepseek-v4.1-flash` 发起对话，第一次偶发失败，之后一分钟内每次请求都立刻失败：
 ```
 429 every account is rate-limited for model deepseek-v4.1-flash
@@ -47,7 +69,7 @@
 (x0.03 credits) and is rate-limited separately; switch to it to keep going
 ```
 `tried 0` 是关键：这一轮**一个上游请求都没发出去**，全是上一轮留下的冷却。用户的第一反应是「单账号免费额度不可能这么少」——这个直觉是对的。
-### 根因：14003（模型繁忙）被归进了 6004（账号限流）
+#### 根因：14003（模型繁忙）被归进了 6004（账号限流）
 上游有两种完全不同的 429：
 
 | 业务码 | 含义 | 责任方 | 正确反应 |
@@ -58,15 +80,15 @@
 两者都是 HTTP 429，而 `classifyUpstreamError` 先看状态码：`if (status === 429) return 'soft_rate'`。14003 于是被当成限流，`parseRateLimitReset` 在 14003 报文里找不到重置时间，`penalize` 退到默认的 60 秒。六个账号各被冷却一次，这一模型在整池里就彻底不可用了。
 
 上游自己说得很清楚：「这个模型当前请求量饱和，与你的网络无关。」换号毫无意义——池里每个账号都在同一堵墙前面。
-### 修法
+#### 修法
 - `upstream.ts` 新增失败类别 `model_busy`，判定**放在状态码规则之前**：报文里带 `"code":14003`（数字或字符串）或命中「模型繁忙 / 请求量饱和 / model busy / currently saturated」即命中。刻意不把 `too many requests` 写进模式——那句话在 14003 和 6004 的报文里都出现，写进去会把真正的限流也变成「重试别冷却」。
 - `shim.ts` 新增 `chatStreamWithSaturationRetry()`：命中 `model_busy` 时**同一个账号原地重试**，退避 2 秒、4 秒（`saturationRetryDelaysMs` 可调，`[]` 关闭），不写任何冷却标记、不换号。
 - 三条车道都接上：主聊天循环、上下文压缩后的重试、路由链成员。路由链里继续往下一个成员走是有意义的——下一个成员是**另一个模型**，不站同一条队。
 - 重试仍饱和时单独回报：`429 model_busy`，文案点名模型、说明「这是模型队列不是你的额度、池里每个账号都会被拒、没有账号被冷却、不需要重新登录」，并附上上游原文。
 - 新增 6 条回归用例：14003 判 `model_busy`、字符串码与纯文案都能识别、6004 仍是 `soft_rate`（反向保护）、饱和时同一账号重试且零冷却、持续饱和时的报错文案、饱和后下一次请求仍能真正发出。
-## 未发布 — WorkBuddy 主聊天车道恢复（网关 400 / code 11128）
+### WorkBuddy 主聊天车道恢复（网关 400 / code 11128）
 > 一次彻头彻尾的车道中断：所有 WorkBuddy 聊天请求被上游网关拒收，报 400 + code 11128「request illegal」，提示语还说是「没通过渠道校验、不是官方客户端发出的」。提示语是骗人的。
-### 现象
+#### 现象
 在 DSH 里选任一 WorkBuddy 模型发起对话，立刻失败：
 ```
 400 workbuddy upstream client (http 400) after 1 account(s) [xxx@gmail.com#a184c1c1]:
@@ -74,7 +96,7 @@
   "这次调用没通过渠道校验，可能不是官方客户端发出的。请用官方版本重新发送。"}}
 ```
 `after 1 account(s)` 说明池子只试了一个账号就停了——`client` 这类错误在轮转循环里是终态。
-### 根因：缺三个会话标识头，与「客户端身份」无关
+#### 根因：缺三个会话标识头，与「客户端身份」无关
 从桌面端 `WorkBuddyAI/resources/app.asar` 里取出 `applyGatewayHeaders`，它在每个 `/v2/chat/completions` 上设置三个每次现造的 UUID：
 
 | 头 | 作用 |
@@ -89,7 +111,7 @@
 
 顺带纠正一条流传在 vendor 里的错误结论：`pack.js` 注释称「必须传 system 否则 11128」，对当前国际版网关**不成立**——带 system 照样 11128。11128 真正有两个条件，第二个是 `messages[0].role === 'system'`。
 
-### 修法
+#### 修法
 - `upstream.ts` 新增 `chatConversationHeaders()`，两条聊天路径（`chatStream` / `completeChat`）与既有的 `X-IDE-*` 一起发送。
 - `chatStream()` 多一个可选 `conversationId` 参数，由 shim 传入。
 - `shim.ts` 新增 `upstreamConversationId()`：以 `sticky` 已在用的「首条 user 消息哈希」为键，把同一个 DSH 会话映射到同一个上游会话 id（带 512 条上限的 LRU）。这样多轮对话在上游看来是一条线程，而不是每轮一条新线程。
