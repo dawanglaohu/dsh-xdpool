@@ -38155,6 +38155,19 @@ var ModelQueuedError = class extends LlmError6 {
     this.retryAfterMs = options.retryAfterMs;
   }
 };
+/**
+ * 识别「上游模型侧故障」信封：`{"code":"provider_error","message":"Error in upstream response"}`。
+ *
+ * qoder 的模型后端偶发拿不到 token 流时，会用这组字段回一个 error 帧（经
+ * unwrapQoderEnvelopeStream 改写后 `type` 恒为 `model_error`）。它与额度、
+ * 签名、网络都无关，重试通常就好了 —— 所以既要给出可读的成因，也要让宿主
+ * 按短间隔立刻重试，而不是落到默认的 500ms 起跳退避上。
+ */
+function isUpstreamProviderError(code, type, message) {
+  const codeText = typeof code === "string" ? code.toLowerCase() : "";
+  if (codeText === "provider_error") return true;
+  return type === "model_error" && typeof message === "string" && /error in upstream response/i.test(message);
+}
 function isTransportError4(error) {
   if (!(error instanceof Error)) return false;
   const message2 = error.message.toLowerCase();
@@ -38256,6 +38269,13 @@ async function* consumeOpenAiSse(response, options, config) {
             );
           }
           const detail = [String(data.code), data.type].filter(Boolean).join("/");
+          if (isUpstreamProviderError(data.code, data.type, data.message)) {
+            throw new LlmError6(
+              `${label}: 上游模型侧故障${detail.length > 0 ? ` (${detail})` : ""} —— qoder 的模型后端这次没给出 token 流，不是你的额度、签名或网络问题；马上重试或换一个模型`,
+              "SERVER",
+              { providerRetryAfterMs: 2e3 }
+            );
+          }
           throw new LlmError6(
             `${label}: ${data.message}${detail.length > 0 ? ` (${detail})` : ""}`,
             "SERVER"
@@ -38282,6 +38302,13 @@ async function* consumeOpenAiSse(response, options, config) {
               });
             }
             const suffix = status === void 0 ? "" : ` (status=${status})`;
+            if (isUpstreamProviderError(data.code, data.type, data.message)) {
+              throw new LlmError6(
+                `${label}: 上游模型侧故障${suffix} —— qoder 的模型后端这次没给出 token 流，不是你的额度、签名或网络问题；马上重试或换一个模型`,
+                "SERVER",
+                { ...status === void 0 ? {} : { status }, providerRetryAfterMs: 2e3 }
+              );
+            }
             throw new LlmError6(`${label}: ${data.message}${suffix}`, "SERVER", {
               ...status === void 0 ? {} : { status }
             });
@@ -38498,6 +38525,12 @@ function qoderEffortsFor(model) {
   if (model.supportsDisable === true && !efforts.includes("none")) efforts.push("none");
   return efforts;
 }
+function resolveQueueSaturationRounds() {
+  const raw = process.env.DSH_QODER_QUEUE_SATURATION_ROUNDS;
+  if (raw === void 0 || raw.length === 0) return 6;
+  const parsed = Number.parseInt(raw, 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 6;
+}
 function resolveQueueTimeoutMs() {
   const raw = process.env.DSH_QODER_QUEUE_TIMEOUT_MS;
   if (raw === void 0 || raw.length === 0) return 30 * 6e4;
@@ -38581,6 +38614,40 @@ function resolveFirstTokenTimeoutMs4() {
 }
 function resolveChunkTimeoutMs4() {
   return Number.parseInt(process.env.DSH_QODER_SSE_CHUNK_TIMEOUT_MS ?? "", 10) || 12e4;
+}
+/**
+ * 等响应头的上限（毫秒），默认与首 token 上限一致。
+ *
+ * undici 的 `headersTimeout` 默认 **300s**，超时抛 `TypeError: fetch failed`
+ * （`cause` 是 `HeadersTimeoutError`）—— 与真正的连接失败在文案上无法区分，
+ * 且要白等 5 分钟。网关把请求挂住不回响应头时，这条车道就是「卡 5 分钟 +
+ * 一句 fetch failed」，用户既看不出原因，宿主的重试也得排在上一次之后。
+ *
+ * 所以自己掐一个更短的时限，超时报成 `TIMEOUT`（宿主重试策略里本来就收）。
+ */
+function resolveHeadersTimeoutMs4() {
+  const raw = Number.parseInt(process.env.DSH_QODER_HEADERS_TIMEOUT_MS ?? "", 10);
+  return Number.isFinite(raw) && raw > 0 ? raw : 12e4;
+}
+/**
+ * 把 `fetch failed` 摊成一行可判读的原因链。
+ *
+ * undici 把真因（`UND_ERR_HEADERS_TIMEOUT` / `ECONNRESET` / `ENOTFOUND` /
+ * `UND_ERR_SOCKET`）塞在 `error.cause` 里，而 `TypeError.message` 永远只有
+ * "fetch failed"。只报这一句时，「代理断了」「DNS 挂了」「网关挂起」三者
+ * 长得一模一样 —— 这正是本次故障被误判成「风控升级」的原因。
+ */
+function describeTransportCause4(error) {
+  const parts = [];
+  let node = error;
+  for (let depth = 0; depth < 4; depth += 1) {
+    if (!(node instanceof Error)) break;
+    const code = typeof node.code === "string" && node.code.length > 0 ? node.code : void 0;
+    const label = code ?? node.name;
+    if (typeof label === "string" && label.length > 0 && !parts.includes(label)) parts.push(label);
+    node = node.cause;
+  }
+  return parts.join(" <- ");
 }
 var QoderAdapter = class extends LlmAdapter4 {
   constructor(options) {
@@ -38955,6 +39022,13 @@ var QoderAdapter = class extends LlmAdapter4 {
       throw new LlmError7("qoder: \u6392\u961F\u7B49\u5F85\u671F\u95F4\u8BF7\u6C42\u5DF2\u53D6\u6D88", "QUEUE");
     }
     const waitMs = qoderQueueDelayMs(queueInfo);
+    if (queueInfo !== void 0 && queueInfo.serviceAvailable === false && attempts > resolveQueueSaturationRounds()) {
+      const modelKey = typeof queueInfo.modelKey === "string" && queueInfo.modelKey.length > 0 ? queueInfo.modelKey : "该模型";
+      throw new LlmError7(
+        `qoder: ${modelKey} 在 qoder 侧资源饱和（serviceAvailable=false，已连续排队 ${attempts} 轮）—— 不是你的额度、也不是签名或网络问题；换一个模型再试（DSH_QODER_QUEUE_SATURATION_ROUNDS 可调）`,
+        "MODEL_SATURATED"
+      );
+    }
     await this.sleep(waitMs ?? 1e3, options.signal);
     if (isAborted(options.signal)) {
       throw new LlmError7("qoder: \u6392\u961F\u7B49\u5F85\u671F\u95F4\u8BF7\u6C42\u5DF2\u53D6\u6D88", "QUEUE");
@@ -38976,27 +39050,55 @@ var QoderAdapter = class extends LlmAdapter4 {
       "MISSING_CREDENTIAL"
     );
   }
-  /** 发送一次**加密**推理请求（`agent_chat_generation`）。 */
+  /**
+   * 发送一次**加密**推理请求（`agent_chat_generation`）。
+   *
+   * 自带响应头超时：这一层之前完全没有时限，全靠 undici 的 300s 兜底，
+   * 于是「网关挂住」会表现成 5 分钟后的一句 `fetch failed`。
+   *
+   * ⚠️ 计时器必须在**拿到响应头时**就清掉：body 由
+   * `unwrapQoderEnvelopeStream` 继续消费，超时信号若还武装着，会把正常的
+   * 长流式中途掐断（表现为生成到一半突然 TIMEOUT）。
+   */
   async sendEncrypted(request2, options) {
     const headers = new Headers(request2.headers);
     headers.set("Accept", "text/event-stream");
+    const headerTimeoutMs = resolveHeadersTimeoutMs4();
+    const headerClock = new AbortController();
+    let headerTimedOut = false;
+    const timer = setTimeout(() => {
+      headerTimedOut = true;
+      headerClock.abort();
+    }, headerTimeoutMs);
+    const signal = options.signal === void 0 ? headerClock.signal : AbortSignal.any([options.signal, headerClock.signal]);
     try {
       return await this.fetchImpl(request2.url, {
         method: "POST",
         headers,
         body: request2.body,
-        signal: options.signal
+        signal
       });
     } catch (error) {
       if (options.signal?.aborted) throw error;
+      const cause = describeTransportCause4(error);
+      const causeNote = cause.length > 0 ? ` [${cause}]` : "";
+      if (headerTimedOut) {
+        throw new LlmError7(
+          `qoder: 上游 ${headerTimeoutMs}ms 内没有返回响应头（网关挂起，或本地代理把连接静默丢弃）${causeNote}；已按超时处理，可直接重试`,
+          "TIMEOUT",
+          { cause: error }
+        );
+      }
       if (isTransportError4(error)) {
         throw new LlmError7(
-          `qoder: transport error: ${error instanceof Error ? error.message : String(error)}`,
+          `qoder: transport error: ${error instanceof Error ? error.message : String(error)}${causeNote}`,
           "TRANSPORT",
           { cause: error }
         );
       }
       throw error;
+    } finally {
+      clearTimeout(timer);
     }
   }
 };

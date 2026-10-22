@@ -1,8 +1,45 @@
 # Changelog
 本项目的所有重要变更都会记录在此文件。
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
-## 未发布 — 1M 上下文模型真的能压缩了，渠道卡的窗口选择器不再永远停在 200K
-> 三件事收在一起：报出 1M 的模型此前根本压缩不了（外层按 1M 算阈值所以永不触发，真实上限只有 300K，撞上去之后内层的摘要请求自己又超窗，于是「压缩跑过了」却仍然 400）；渠道卡把「没设预算」显示成 200K，1M 那一档因此永远点不中；账号池补上「重测限流」「清除标记」，因为「测试连接」按设计不落盘，永远清不掉限流标记。
+## 未发布 — 1M 上下文模型真的能压缩了，Qoder 不再卡五分钟只回一句 fetch failed
+> 四件事收在一起：报出 1M 的模型此前根本压缩不了（外层按 1M 算阈值所以永不触发，真实上限只有 300K，撞上去之后内层的摘要请求自己又超窗，于是「压缩跑过了」却仍然 400）；渠道卡把「没设预算」显示成 200K，1M 那一档因此永远点不中；账号池补上「重测限流」「清除标记」，因为「测试连接」按设计不落盘，永远清不掉限流标记；Qoder 加密推理补上响应头时限，把 `fetch failed` 摊成可判读的原因链，并让「模型侧饱和」与「模型后端故障」不再伪装成排队超时。
+### Qoder 加密推理：卡五分钟，然后只回一句 `fetch failed`
+> `qoder: transport error: fetch failed` 看起来像厂商封号，其实是这一层根本没有超时 —— 它把 fetch 的 promise 直接交给 undici，而 undici 自己的 `headersTimeout` 是 **300 秒**，超时抛的正是 `TypeError: fetch failed`，和「连接被拒」「代理断了」「DNS 挂了」共用同一句文案。
+#### 现象
+用 Qoder 的模型（`dfmodel`）发起对话，界面转五分钟，然后报：
+```
+qoder: transport error: fetch failed
+```
+宿主的重试策略把它当 `TRANSPORT` 接住并重试，于是界面先显示「重试延迟：501毫秒」，再重复一遍五分钟。用户看到的是「qoder 风控又升级了」，实际上一整轮里没有任何一个字节到达过上游。
+#### 根因：三个层面叠在一起，把「上游没回响应头」伪装成「网络请求失败」
+- **时限层**：`pack.js` 的 `sendEncrypted` 只做 `await this.fetchImpl(url, { method, headers, body, signal })`，自己不设任何期限。fetch 的 promise 在**拿到响应头**时才 resolve，所以响应头不来就等于无限等；真正的兜底是 undici 的 `headersTimeout = 300s`（`pack.js` 内打包的 undici 同一默认值，宿主 `@deepseek-ai/dsh-http-proxy` 的 `createPolicyDispatcher` 用 `new undici.Agent({ factory })` 也不传这个参数，同样是 300s）。
+- **文案层**：undici 超时抛 `TypeError('fetch failed', { cause: HeadersTimeoutError })`。`isTransportError4` 靠 `message.includes('fetch failed')` 命中，于是被包成 `LlmError7(..., 'TRANSPORT')`，而 `error.cause` 在打包那一刻就被丢掉了 —— 真因（`UND_ERR_HEADERS_TIMEOUT`）永远到不了用户眼前。
+- **归因层**：`TRANSPORT` 在宿主的默认可重试码里（`EMPTY_RESPONSE` / `RATE_LIMIT` / `SERVER` / `TIMEOUT` / `TRANSPORT`），所以它会被原样重试，而不是换个策略。一次挂起于是变成五次挂起。
+会话日志复算证实了这一点：`request/header` 到 `assistant/attempt` 之间是 **315.2 秒**，而本地用「永不应答的 server + undici 默认配置」复现出的正是 `elapsed≈305.9s` / `TypeError: fetch failed` / `cause=UND_ERR_HEADERS_TIMEOUT`。同一账号打同一端点 25 次则全部 200 并在 1 秒内返回排队信封（`10605` / `isQueued: true` / `Retry-After: 30`），所以既不是封号也不是限流：**是这个端点有时会挂住不回响应头，而这条车道没有任何机制把「挂住」和「失败」分开。**
+#### 修法
+- `pack.js` 新增 `resolveHeadersTimeoutMs4()`：等响应头的上限，默认 `120000`（与 `DSH_QODER_SSE_FIRST_TOKEN_TIMEOUT_MS` 同档），可用 `DSH_QODER_HEADERS_TIMEOUT_MS` 覆盖。非法值（`NaN` / 0 / 负数）退回默认，不允许变成「0 毫秒」把每个请求在发出前就掐死。
+- `sendEncrypted` 自己持一个 `AbortController` + `setTimeout`，用 `AbortSignal.any([options.signal, headerClock.signal])` 与调用方的取消信号合并；超时抛 `TIMEOUT`（文案里带上限值与「网关挂起，或本地代理把连接静默丢弃」两种可能），**不再报成 `TRANSPORT`** —— 宿主两种码都会重试，但报错文案从此能自证是「我们掐的」而不是「网络拒绝了我们」。
+- `finally { clearTimeout(timer) }`，并且计时器只在**响应头到达时**清：body 由 `unwrapQoderEnvelopeStream` 继续消费，超时信号若还武装着，会把正常的长流式中途掐断（表现为生成到一半突然 `TIMEOUT`）。
+- 新增 `describeTransportCause4()`：沿 `error.cause` 链最多四层收 `code`（没有就取 `name`），去重后拼成 `A <- B`。`fetch failed` 之后追加 `[TypeError <- ECONNREFUSED]` 这类注记，「代理断了 / DNS 挂了 / 网关挂起」三者从此可区分。
+- 调用方的 abort 仍原样抛出，不包装：用户按停止不是厂商故障，也不该被重试。
+- 新增 `tests/qoder-header-timeout.test.ts`（6 条用例，全部起真实 socket 而不是 stub，因为要钉的是时序）：默认值与 env 覆盖、非法值退回默认、永不应答的 server 报 `TIMEOUT` 且耗时远小于 300s、响应头到达后计时器解除（body 拖到时限之外仍然读完）、`ECONNREFUSED` 仍报 `TRANSPORT` 且带上原因链、外部 abort 原样抛出。
+### Qoder 模型侧：饱和与后端故障不再伪装成「排队超时」
+> 上一节把「挂住」和「失败」分开了，但那一轮重试真正撞上的东西还在：qoder 对没有可调度容量的模型，用 **HTTP 200 + SSE 信封**回 `10605 / isQueued:true / serviceAvailable:false`。这不是错误，是一张排队号，而这条车道会一直等它 —— 最长 30 分钟、180 轮。
+#### 现象
+用 `dfmodel` 发起对话，界面转很久，最后报 `qoder: 排队等待超时`；或者很快报：
+```
+qoder: Error in upstream response (provider_error/model_error)
+```
+两句都读不出「到底是谁的问题、该做什么」。前一句让人以为队列会自己好，后一句像是渠道被封。
+#### 实测：这两个模型的队列不会自己好
+同一账号连打 `dfmodel` 25 次（间隔 2 秒，每次 70 秒上限）：**1 次返回 token 流，24 次在 400–600ms 内返回同一个 10605 信封**。11 个模型扫一遍，只有 `qmodel_38max_thinking` 能正常出流，`dfmodel`/`dmodel`/`qfmodel`/`qmodel_38max`/`smodel`/`kmodel`/`gmodel`/`cmodel`/`auto` 全部 10605。而用量接口对 4 个凭据都返回 `isQuotaExceeded:false`、`remaining` 充足 —— **额度没超，是这个模型在这个账号上没有可调度容量**，`serviceAvailable:false` 就是它自己说的。等下去只会等到超时。
+`provider_error` 则是另一类：模型后端压根没产出 token 流（`code:"provider_error"`, `message:"Error in upstream response"`，经信封改写后 `type` 恒为 `model_error`）。它来得快（会话日志里首次尝试 56.5 秒），和额度、签名、网络都无关，重试通常就好 —— 但此前被压成 `SERVER` + 通用文案，宿主的默认退避从 500ms 起跳，用户看到的「重试延迟：2021毫秒」正是第三次退避。
+#### 修法
+- `consumeOpenAiSse` 的两条 error 分支各加一次 `isUpstreamProviderError(code, type, message)` 判定（`code === 'provider_error'`，或 `type === 'model_error'` 且 message 含 `Error in upstream response`），命中时抛可读文案（「上游模型侧故障 … 不是你的额度、签名或网络问题；马上重试或换一个模型」）并带 `providerRetryAfterMs: 2e3` —— 宿主 `dsh-llm-retry` 见到这个字段就按它退避，不再从 500ms 重新爬。
+- 判定**只看这两个字段**，刻意不匹配 10605 信封：那个信封同样是 `code:403` + `type:model_error`，误判成后端故障会绕过排队处理，正好毁掉这条车道唯一有用的机制。
+- `waitForQueue` 增加饱和快速失败：`queueInfo.serviceAvailable === false` 且已连续排队超过 `resolveQueueSaturationRounds()`（默认 6 轮，`DSH_QODER_QUEUE_SATURATION_ROUNDS` 可调）时抛 `MODEL_SATURATED`，文案点名模型、点明 `serviceAvailable=false`、并明说「不是你的额度、也不是签名或网络问题；换一个模型再试」。6 轮 × 10 秒上限 ≈ 1 分钟给出答案，而不是 30 分钟。
+- 用**不可重试**的 `MODEL_SATURATED` 而不是 `SERVER`：`SERVER` 在宿主的默认可重试码里，5 次重试会把 6 轮放大成十分钟，而且每次都会重走同一条注定失败的队列。`serviceAvailable:true` 与「字段缺失」都不触发快速失败 —— 那才是「等一等会好」的情形，也是这段代码本来要服务的对象。
+- 新增 `tests/qoder-saturation.test.ts`（7 条用例）：`provider_error` 的三种命中形态、不吞掉 10605/110/无 code 的普通错误、轮次默认值与 env 覆盖（含非法值退回）、饱和时抛 `MODEL_SATURATED` 且文案含模型名与「不是你的额度」、`serviceAvailable:true`/缺失时继续等、真正的排队超时仍报 `QUEUE`、两处调用点确实接线。
 ### 上下文压缩：声明 1M 的模型一次都没压缩成功过
 > 报错原文是 `This model's maximum context length was exceeded: the prompt is too large for model deepseek-v4.1-flash-sg, and the conversation could not be compacted in place (upstream client after compaction)`。括号里那句 `after compaction` 是关键：压缩确实跑过了，是压缩**之后**的重试又被判成终态 `client`。
 #### 现象
