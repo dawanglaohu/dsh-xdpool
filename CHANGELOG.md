@@ -1,7 +1,7 @@
 # Changelog
 本项目的所有重要变更都会记录在此文件。
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
-## 2.4.1 — 1M 上下文模型真的能压缩了，Qoder 不再卡五分钟只回一句 fetch failed
+## 2.4.3 — 1M 上下文模型真的能压缩了，Qoder 不再卡五分钟只回一句 fetch failed
 > 四件事收在一起：报出 1M 的模型此前根本压缩不了（外层按 1M 算阈值所以永不触发，真实上限只有 300K，撞上去之后内层的摘要请求自己又超窗，于是「压缩跑过了」却仍然 400）；渠道卡把「没设预算」显示成 200K，1M 那一档因此永远点不中；账号池补上「重测限流」「清除标记」，因为「测试连接」按设计不落盘，永远清不掉限流标记；Qoder 加密推理补上响应头时限，把 `fetch failed` 摊成可判读的原因链，并让「模型侧饱和」与「模型后端故障」不再伪装成排队超时。
 ### Qoder 加密推理：卡五分钟，然后只回一句 `fetch failed`
 > `qoder: transport error: fetch failed` 看起来像厂商封号，其实是这一层根本没有超时 —— 它把 fetch 的 promise 直接交给 undici，而 undici 自己的 `headersTimeout` 是 **300 秒**，超时抛的正是 `TypeError: fetch failed`，和「连接被拒」「代理断了」「DNS 挂了」共用同一句文案。
