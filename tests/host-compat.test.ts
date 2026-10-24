@@ -33,6 +33,8 @@ import type { WorkBuddyUpstreamClient } from '../src/upstream.ts'
 const hostSource = readFileSync(new URL('../src/index.ts', import.meta.url), 'utf8')
 /** Source of the browser entry. */
 const clientSource = readFileSync(new URL('../src/client/index.tsx', import.meta.url), 'utf8')
+/** Source of the card the entry registers — the other half of the client contract. */
+const cardSource = readFileSync(new URL('../src/client/PoolCard.tsx', import.meta.url), 'utf8')
 
 /**
  * Mark a schema field volatile the way `src/index.ts` does.
@@ -269,7 +271,13 @@ describe('the browser entry stays loadable on both lines', () => {
     // silently shows no card; `settings.section` is the left-nav page both
     // lines declare (it is what Token Saver and the built-in pages use).
     expect(clientSource).toContain("ctx.slots.inject('settings.section'")
+    // Both halves, not just the entry: the card's own props type named the
+    // retired slot too, and scanning only the entry let that copy survive until
+    // a host line tightened `PropsRuntime`'s key constraint and turned it into a
+    // typecheck failure instead of a silent no-op.
     expect(clientSource).not.toContain("'settings.plugin.item'")
+    expect(cardSource).not.toContain("'settings.plugin.item'")
+    expect(cardSource).toContain("PropsRuntime<'settings.section'>")
   })
 
   it('keys the 0.1.7 form by the host entry id, and the 0.1.5 one by namespace', () => {
