@@ -34299,6 +34299,12 @@ var CODEBUDDY = {
   platform: "ide",
   endpoint: "https://copilot.tencent.com",
   apiDomain: "copilot.tencent.com",
+  // 国内扫码登录已迁移到 WorkBuddy；模型与积分仍沿用原有 CodeBuddy 端点。
+  login: {
+    endpoint: "https://www.workbuddy.cn",
+    apiDomain: "www.workbuddy.cn",
+    platform: "workbuddy"
+  },
   displayName: "CodeBuddy (\u817E\u8BAF)",
   productCode: "codebuddy",
   userAgent: "CodeBuddyIDE/1.106.1",
@@ -34308,7 +34314,8 @@ var CODEBUDDY = {
   clientVersion: "1.106.1",
   cliVersion: "2.137.1",
   defaultCredentialRef: "BUDDY_ACCESS_TOKEN",
-  appendSessionParams: false,
+  appendSessionParams: true,
+  pluginVersion: "5.8.3",
   fallbackModels: CODEBUDDY_FALLBACK_MODELS
 };
 var WORKBUDDY_FALLBACK_MODELS = [
@@ -43778,9 +43785,10 @@ async function request(method, url, headers, options) {
   return { status: response.status, body };
 }
 async function fetchAuthState(fetcher = fetch, signal, product = CODEBUDDY) {
-  const url = `${product.endpoint}${AUTH_STATE_PATH}?platform=${product.platform}`;
+  const login = product.login ?? product;
+  const url = `${login.endpoint}${AUTH_STATE_PATH}?platform=${login.platform}`;
   const headers = {
-    [HTTP_HEADER_DOMAIN]: product.apiDomain,
+    [HTTP_HEADER_DOMAIN]: login.apiDomain,
     [HTTP_HEADER_NO_AUTHORIZATION]: "true",
     [HTTP_HEADER_NO_USER_ID]: "true",
     [HTTP_HEADER_NO_ENTERPRISE_ID]: "true",
@@ -43809,7 +43817,8 @@ async function fetchAuthState(fetcher = fetch, signal, product = CODEBUDDY) {
 async function loopGetToken(state, options = {}) {
   const fetcher = options.fetcher ?? fetch;
   const product = options.product ?? CODEBUDDY;
-  const url = `${product.endpoint}${AUTH_TOKEN_PATH}?state=${encodeURIComponent(state)}`;
+  const login = product.login ?? product;
+  const url = `${login.endpoint}${AUTH_TOKEN_PATH}?state=${encodeURIComponent(state)}`;
   const headers = {
     [HTTP_HEADER_NO_AUTHORIZATION]: "true",
     "User-Agent": product.userAgent
@@ -43844,7 +43853,8 @@ async function loopGetToken(state, options = {}) {
 async function getAccount(state, token, options = {}) {
   const fetcher = options.fetcher ?? fetch;
   const product = options.product ?? CODEBUDDY;
-  const url = `${product.endpoint}${LOGIN_ACCOUNT_PATH}?state=${encodeURIComponent(state)}`;
+  const login = product.login ?? product;
+  const url = `${login.endpoint}${LOGIN_ACCOUNT_PATH}?state=${encodeURIComponent(state)}`;
   const headers = {
     // ⚠️ `||` 而非裸 `token.domain`：token 由 `parseTokenData` → `readStringField`
     // 产出，该函数在字段缺失/类型不符时返回**空串**（不是 `undefined`），裸用会
@@ -43859,7 +43869,7 @@ async function getAccount(state, token, options = {}) {
     // 会过期的历史快照 —— 与 adapter 那处的方向差异是有意的，差异只在「兜底值
     // 取谁」，判据一致（空串必回退）。回归用例见 `tests/unit/buddy-oauth.spec.ts`
     // 的「token.domain 为空串时…」与「token.domain 非空时…」两条。
-    [HTTP_HEADER_DOMAIN]: token.domain || product.apiDomain,
+    [HTTP_HEADER_DOMAIN]: token.domain || login.apiDomain,
     Authorization: `Bearer ${token.accessToken}`,
     [HTTP_HEADER_NO_USER_ID]: "true",
     [HTTP_HEADER_NO_ENTERPRISE_ID]: "true",
