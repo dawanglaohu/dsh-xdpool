@@ -95,7 +95,7 @@ export interface PoolCardSettingsScope {
  * it is declared here as optional — every use site guards for its absence and
  * falls back to a read-only card.
  */
-export type PoolCardProps = PropsRuntime<'settings.plugin.item'>
+export type PoolCardProps = PropsRuntime<'settings.section'>
   & Partial<PoolCardInjected>
   & { settingsScope?: PoolCardSettingsScope }
 /**

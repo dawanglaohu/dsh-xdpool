@@ -119,9 +119,9 @@ Measured across four accounts, one pass collected **3300 credits and 135 energy*
 
 ## Install
 
-Prerequisite: the WorkBuddy desktop app installed and signed in (the plugin reuses the sign-in state it stores locally). Multi-account = sign in and out a few times in the desktop app; each sign-in is absorbed into the pool. Built against DSH Desktop host `0.1.2`.
+Prerequisite: the WorkBuddy desktop app installed and signed in (the plugin reuses the sign-in state it stores locally). Multi-account = sign in and out a few times in the desktop app; each sign-in is absorbed into the pool. Built against the DSH Desktop `0.2.1` host line.
 
-> Compatible with the `0.1.1-rc.2` / `0.1.2` host line: the settings section installs via `settings.installSection` (0.1.2-rc.1+) or the earlier free-function form, whichever the host supports.
+> Compatible with the whole `0.1.1-rc.2`+ `0.1.x` series and with `0.2.0` / `0.2.1` (including `0.2.1-rc.2` and `0.2.1-rc.3`): the settings section installs via `settings.installSection` (0.1.2-rc.1+) or the earlier free-function form, whichever the host supports, and from `0.2.0` on the card renders as a peer tab of the settings panel.
 
 **Option A — install from this repository (recommended)**
 

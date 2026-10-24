@@ -61,11 +61,12 @@ describe('the billion-context reader', () => {
     const source = readCode('../src/billion.ts')
     expect(source).not.toContain('DSH_HOME')
     expect(source).toContain('join(home,')
-    // …and DSH_HOME is present in this very process, which is what made the bug
-    // live rather than theoretical.
-    if (typeof process.env.DSH_HOME === 'string' && process.env.DSH_HOME !== '') {
-      expect(process.env.DSH_HOME.startsWith(process.env.USERPROFILE ?? ' ')).toBe(false)
-    }
+    // …and the module resolves its root from the OS home directory, which is
+    // what makes the two variables distinguishable at all. Asserting a RELATION
+    // between DSH_HOME and USERPROFILE (e.g. "DSH_HOME is not under the profile")
+    // pinned a property of one machine's layout: on Windows the desktop profile
+    // lives at %USERPROFILE%\.dsh, so that assertion failed on a correct build.
+    expect(source).toContain("homedir()")
   })
   it('reports missing instead of failing when no proxy is recorded', async () => {
     // Point the reader at a state directory that cannot hold a proxy. This is
