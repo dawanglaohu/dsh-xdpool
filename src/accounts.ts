@@ -16,6 +16,7 @@ import { homedir } from 'node:os'
 import { basename, join, resolve } from 'node:path'
 import { regionOf, type WorkBuddyRegion } from './upstream.ts'
 import { accountStorePath, isStateFile, loadStoredAccounts, saveStoredAccounts, snapshotDirPath } from './account-store.ts'
+import { parseJsonDocument } from './json-file.ts'
 import {
   encryptedFieldKeyId,
   isEncryptedFieldWrapper,
@@ -117,6 +118,19 @@ export interface WorkBuddyAccount {
    * `0`/undefined means "not known to be dead".
    */
   credentialDeadUntilMs?: number
+  /**
+   * Epoch ms until which this account is skipped because the upstream RESTRICTED
+   * it (business code 11140, "request illegal / 账号存在异常"), not because its
+   * sign-in is gone.
+   *
+   * Kept apart from {@link credentialDeadUntilMs} because the two need opposite
+   * handling: a dead sign-in is revived by refreshing/signing in, while a
+   * restricted account answers the token refresh with a new, perfectly valid
+   * token and still refuses every chat call. Marking it dead therefore spent a
+   * refresh per request AND told the user to sign in again — advice that cannot
+   * help. `0`/undefined means "not known to be restricted".
+   */
+  restrictedUntilMs?: number
 }
 
 function nonEmptyEnv(value: unknown): string | undefined {
@@ -237,12 +251,7 @@ export function parseWorkBuddyAuth(
   sourcePath: string,
   decrypt?: (field: unknown) => string,
 ): WorkBuddyCredential | undefined {
-  let parsed: unknown
-  try {
-    parsed = JSON.parse(text)
-  } catch {
-    return undefined
-  }
+  const parsed = parseJsonDocument(text)
   if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return undefined
   const document = parsed as Record<string, unknown>
 
@@ -454,12 +463,7 @@ async function readCredential(path: string): Promise<WorkBuddyCredential | undef
  * back to the full parse for those.
  */
 export function cheapIdentityId(text: string): string | undefined {
-  let parsed: unknown
-  try {
-    parsed = JSON.parse(text)
-  } catch {
-    return undefined
-  }
+  const parsed = parseJsonDocument(text)
   if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return undefined
   const document = parsed as Record<string, unknown>
   const identity =
@@ -499,12 +503,10 @@ async function skipReasonFor(path: string): Promise<WorkBuddySkippedFile['reason
     return 'unreadable'
   }
   if (text.includes('"$wbEncrypted"')) return 'encrypted'
-  try {
-    JSON.parse(text)
-    return 'malformed'
-  } catch {
-    return 'malformed'
-  }
+  // Deliberately not parsed here: every unreadable document is 'malformed' to
+  // this caller, so the only thing a parse could add is the chance to disagree
+  // with {@link parseWorkBuddyAuth} about a byte-order mark.
+  return 'malformed'
 }
 
 /**
@@ -576,6 +578,12 @@ export interface AccountPoolOptions {
    * (default 30 minutes). Only a fresh sign-in in the desktop app clears it.
    */
   credentialDeadCooldownMs?: number
+  /**
+   * How long an account rests after the upstream restricts it (default one
+   * hour). Distinct from the credential-dead rest because a restriction cannot
+   * be fixed by signing in.
+   */
+  restrictedCooldownMs?: number
   /** Upstream client used to refresh near-expiry tokens. */
   client?: TokenRefresher
   /** Refresh this long before actual expiry; default five minutes. */
@@ -658,6 +666,17 @@ const EXHAUST_COOLDOWN_MS = 30 * 60 * 1000
 const CREDENTIAL_DEAD_COOLDOWN_MS = 30 * 60 * 1000
 
 /**
+ * Default rest for an account the upstream has restricted (business code 11140).
+ *
+ * The gateway lifts a restriction on its own schedule and in the meantime
+ * refuses every call from that account, so there is no reset header to read and
+ * nothing the user can do locally. Long enough that one restricted account never
+ * absorbs a request's retry budget, and short enough that it rejoins on its own
+ * once the gateway relents — signs of life clear it sooner.
+ */
+const RESTRICTED_COOLDOWN_MS = 60 * 60 * 1000
+
+/**
  * Does this refresh failure prove the credential itself is dead?
  *
  * The upstream answers a revoked refresh token with `invalid_grant: Offline user
@@ -687,6 +706,12 @@ export class WorkBuddyAccountPool {
    * sign-in. Cleared by a newer credential file or an explicit sign-in.
    */
   private credentialDeadCooldownMs: number
+  /**
+   * How long an account stays out of rotation after the upstream restricted it
+   * (business code 11140). Cleared by a newer credential file, an explicit
+   * sign-in, or a call that succeeds again.
+   */
+  private restrictedCooldownMs: number
   private readonly client: TokenRefresher | undefined
   private readonly refreshMarginMs: number
   private accounts: WorkBuddyAccount[] = []
@@ -814,6 +839,7 @@ export class WorkBuddyAccountPool {
     this.cooldownMs = options.cooldownMs ?? 60_000
     this.exhaustCooldownMs = options.exhaustCooldownMs ?? EXHAUST_COOLDOWN_MS
     this.credentialDeadCooldownMs = options.credentialDeadCooldownMs ?? CREDENTIAL_DEAD_COOLDOWN_MS
+    this.restrictedCooldownMs = options.restrictedCooldownMs ?? RESTRICTED_COOLDOWN_MS
     this.client = options.client
     this.refreshMarginMs = options.refreshMarginMs ?? 5 * 60 * 1000
     // Priority is the default: users pool their own accounts to spend one
@@ -1019,6 +1045,8 @@ export class WorkBuddyAccountPool {
           ...existing,
           credential,
           label: accountLabel(credential),
+          // A fresh sign-in revives a dead credential but cannot lift a
+          // gateway restriction, so only the dead mark is cleared here.
           ...signedInAgain ? { credentialDeadUntilMs: 0 } : {},
         })
       }
@@ -1079,6 +1107,10 @@ export class WorkBuddyAccountPool {
       // (the upstream never rewrites its expiry), so this is the only thing
       // keeping a dead account from absorbing every retry of a request.
       if ((account.credentialDeadUntilMs ?? 0) > now) return false
+      // Restricted by the gateway (11140): the credential is fine and the
+      // caller's sign-in state is irrelevant, so nothing but time — or the
+      // gateway relenting — puts this account back in play.
+      if ((account.restrictedUntilMs ?? 0) > now) return false
       if (modelId !== undefined && (account.modelCooldowns[modelId] ?? 0) > now) return false
       // A region-scoped caller (one of the two providers) must never pick
       // an account that talks to the other region gateway.
@@ -1106,37 +1138,53 @@ export class WorkBuddyAccountPool {
     disabled: number
     /** Accounts skipped because the upstream rejected their sign-in. */
     dead: number
-    reason: 'empty' | 'cooling' | 'disabled' | 'reserve' | 'session_dead' | 'none'
+    /** Accounts skipped because the upstream restricted them (business code 11140). */
+    restricted: number
+    reason: 'empty' | 'cooling' | 'disabled' | 'reserve' | 'session_dead' | 'restricted' | 'none'
   } {
     const now = Date.now()
     const inRegion = this.accounts.filter(
       account => region === undefined || regionOf(account.credential.domain) === region,
     )
-    if (inRegion.length === 0) return { total: 0, cooling: 0, disabled: 0, dead: 0, reason: 'empty' }
+    if (inRegion.length === 0) {
+      return { total: 0, cooling: 0, disabled: 0, dead: 0, restricted: 0, reason: 'empty' }
+    }
 
     let cooling = 0
     let disabled = 0
     let dead = 0
+    let restricted = 0
     for (const account of inRegion) {
       if (this.disabledIds.has(account.id)) { disabled += 1; continue }
       // Sign-in rejected: counted separately from "cooling", because the remedy
       // is the opposite one (sign in again, not wait).
       if ((account.credentialDeadUntilMs ?? 0) > now) { dead += 1; continue }
+      // Restricted by the gateway: also separate, because neither waiting out a
+      // rate window nor signing in again applies — the account simply cannot
+      // serve until the upstream lifts it.
+      if ((account.restrictedUntilMs ?? 0) > now) { restricted += 1; continue }
       const modelCooling = modelId !== undefined && (account.modelCooldowns[modelId] ?? 0) > now
       if (account.cooldownUntilMs > now || modelCooling) { cooling += 1; continue }
       const reserve = this.creditReserves.get(account.id)
       if (reserve !== undefined && reserve > 0) {
         const balance = this.creditBalances.get(account.id)
         if (balance !== undefined && balance <= reserve) {
-          return { total: inRegion.length, cooling, disabled, dead, reason: 'reserve' }
+          return { total: inRegion.length, cooling, disabled, dead, restricted, reason: 'reserve' }
         }
       }
     }
     // A rejected sign-in outranks a cooldown: waiting does not fix it.
-    if (dead > 0) return { total: inRegion.length, cooling, disabled, dead, reason: 'session_dead' }
-    if (cooling > 0) return { total: inRegion.length, cooling, disabled, dead, reason: 'cooling' }
-    if (disabled > 0) return { total: inRegion.length, cooling, disabled, dead, reason: 'disabled' }
-    return { total: inRegion.length, cooling, disabled, dead, reason: 'none' }
+    if (dead > 0) {
+      return { total: inRegion.length, cooling, disabled, dead, restricted, reason: 'session_dead' }
+    }
+    // Same rank: nothing the user can do locally either way, and saying
+    // "sign in again" over a restriction sends them after a fix that cannot work.
+    if (restricted > 0) {
+      return { total: inRegion.length, cooling, disabled, dead, restricted, reason: 'restricted' }
+    }
+    if (cooling > 0) return { total: inRegion.length, cooling, disabled, dead, restricted, reason: 'cooling' }
+    if (disabled > 0) return { total: inRegion.length, cooling, disabled, dead, restricted, reason: 'disabled' }
+    return { total: inRegion.length, cooling, disabled, dead, restricted, reason: 'none' }
   }
 
   /** Round-robin: the legacy cursor walk, kept for the distribution that asks for it. */
@@ -1524,6 +1572,42 @@ export class WorkBuddyAccountPool {
   }
 
   /**
+   * Cool a whole account because the upstream RESTRICTED it (business code
+   * 11140), which is not the same event as a rejected sign-in and must not be
+   * recorded as one.
+   *
+   * The credential is intact — a token refresh on a restricted account returns a
+   * brand-new access token and every chat call still answers 11140 — so the
+   * account is set aside purely on time. Calling {@link penalizeCredentialDead}
+   * here instead cost one refresh per request and told the user their sign-in
+   * had been revoked, which both wasted the retry budget and pointed at a fix
+   * (sign in again) that provably does nothing.
+   */
+  penalizeRestricted(accountId: string): void {
+    const account = this.accounts.find(item => item.id === accountId)
+    if (account === undefined) return
+    const until = Date.now() + this.restrictedCooldownMs
+    account.restrictedUntilMs = Math.max(account.restrictedUntilMs ?? 0, until)
+    this.logger?.warn(
+      `dsh-xdpool: ${account.label} is restricted by the upstream gateway (11140); `
+        + `keeping it out of rotation until ${new Date(until).toISOString()} (signing in again does not lift a restriction)`,
+    )
+  }
+
+  /** Put an account back in rotation after the upstream stopped restricting it. */
+  clearRestricted(accountId: string): void {
+    const account = this.accounts.find(item => item.id === accountId)
+    if (account === undefined) return
+    account.restrictedUntilMs = 0
+  }
+
+  /** Accounts currently kept out of rotation because the upstream restricted them. */
+  restrictedAccounts(): readonly WorkBuddyAccount[] {
+    const now = Date.now()
+    return this.accounts.filter(account => (account.restrictedUntilMs ?? 0) > now)
+  }
+
+  /**
    * Refresh the account's access token when it is within the margin (or already
    * expired), in-flight de-duped per account. A failed refresh keeps the
    * existing token when it has not yet expired, so an unreachable refresh
@@ -1568,7 +1652,9 @@ export class WorkBuddyAccountPool {
           ...outcome.domain === undefined || outcome.domain === '' ? {} : { domain: outcome.domain },
         }
         // A working refresh is the strongest possible proof the sign-in is
-        // alive again — undo any earlier dead mark.
+        // alive again — undo any earlier dead mark. It proves nothing about a
+        // restriction (the gateway hands a new token to a restricted account and
+        // still refuses its chat calls), so that mark is left to expire.
         this.clearCredentialDead(account.id)
         this.logger?.info?.(`dsh-xdpool: refreshed token for ${account.label}`)
         return true
@@ -1664,17 +1750,19 @@ ${new Date(until).toISOString()}
       // next request re-marks it, so the cost of clearing is one failed attempt
       // and the benefit is that a working account is never hidden by a stale mark.
       account.credentialDeadUntilMs = 0
+      account.restrictedUntilMs = 0
     }
   }
 
   /** Diagnostics snapshot. Account-wide cooling count (per-model cooling excluded:
    *  the account as a whole stays usable when only one model is limited). */
-  status(): { count: number; cooling: number; dead: number; lastScanAtMs: number } {
+  status(): { count: number; cooling: number; dead: number; restricted: number; lastScanAtMs: number } {
     const now = Date.now()
     return {
       count: this.accounts.length,
       cooling: this.accounts.filter(account => account.cooldownUntilMs > now).length,
       dead: this.accounts.filter(account => (account.credentialDeadUntilMs ?? 0) > now).length,
+      restricted: this.accounts.filter(account => (account.restrictedUntilMs ?? 0) > now).length,
       lastScanAtMs: this.lastScanAtMs,
     }
   }

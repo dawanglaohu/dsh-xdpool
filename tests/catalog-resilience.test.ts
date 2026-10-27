@@ -240,3 +240,49 @@ describe('C. the built-in table hides nothing the user had enabled', () => {
     expect(new Set(ids).size).toBe(ids.length)
   })
 })
+
+describe('D. a live roster keeps the models the gateway does not advertise', () => {
+  // The international config advertises thirteen models and not one of them is a
+  // free row, so replacing the table with the live answer left an exhausted
+  // account with an empty picker. The merge below is what keeps them.
+  it('appends the unadvertised rows instead of dropping them', () => {
+    const catalog = new WorkBuddyCatalog('global')
+    catalog.updateFromUpstream([upstreamModel('glm-5.3')] as never)
+    const ids = catalog.current().map(m => m.id)
+    expect(catalog.currentSource()).toBe('live')
+    expect(ids).toContain('glm-5.3')
+    for (const id of ['hy3', 'deepseek-v4.1-flash', 'step-5-preview']) {
+      expect(ids, `${id} should survive the merge`).toContain(id)
+    }
+  })
+
+  it('keeps an id only the gateway knows, at the front', () => {
+    const catalog = new WorkBuddyCatalog('cn')
+    catalog.updateFromUpstream([upstreamModel('brand-new-model')] as never)
+    expect(catalog.current()[0]?.id).toBe('brand-new-model')
+  })
+
+  it('withholds the international rows the gateway refuses', () => {
+    // Each of these answered `11102 service info not found` on workbuddy.ai.
+    const catalog = new WorkBuddyCatalog('global')
+    catalog.updateFromUpstream([upstreamModel('glm-5.3')] as never)
+    const ids = catalog.current().map(m => m.id)
+    for (const id of ['hy3-x', 'deepseek-v4-pro', 'deepseek-v4-flash', 'kimi-k3-1']) {
+      expect(ids, `${id} is refused internationally`).not.toContain(id)
+    }
+    // The CN roster has no reason to hide them.
+    const cn = new WorkBuddyCatalog('cn')
+    cn.updateFromUpstream([upstreamModel('glm-5.3')] as never)
+    expect(cn.current().map(m => m.id)).toContain('deepseek-v4-pro')
+  })
+
+  it('never lets a merged row shadow the live one', () => {
+    // The live row is the one carrying this session's real multiplier and window,
+    // so an id the gateway named must not appear a second time from the table.
+    const catalog = new WorkBuddyCatalog('cn')
+    catalog.updateFromUpstream([upstreamModel('glm-5.3', 'Glm-5.3 Live')] as never)
+    const named = catalog.current().filter(m => m.id === 'glm-5.3')
+    expect(named).toHaveLength(1)
+    expect(named[0]?.name).toBe('Glm-5.3 Live')
+  })
+})

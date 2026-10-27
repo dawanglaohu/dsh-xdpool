@@ -30,6 +30,7 @@ import { env } from 'node:process'
 import type { AggregateSettings, ProviderRecord, ProviderSetting } from './providers.ts'
 import { getProvider, listProviderIds, PROVIDERS } from './providers.ts'
 import { normalizeCombos, type ComboSetting } from './combos.ts'
+import { parseJsonDocument } from './json-file.ts'
 /**
  * The aggregate section as it lives on disk.
  *
@@ -133,20 +134,14 @@ export async function readAggregateSettings(): Promise<AggregateStore> {
   } catch {
     return {}
   }
-  let parsed: unknown
-  try {
-    parsed = JSON.parse(raw)
-  } catch {
-    return {}
-  }
-  return normalizeStore(parsed)
+  return normalizeStore(parseJsonDocument(raw))
 }
 /** Read the store on the synchronous path; same rules, no cache. */
 export function readAggregateSettingsSync(): AggregateStore {
   const path = aggregateSettingsPath()
   if (path === undefined) return {}
   try {
-    return normalizeStore(JSON.parse(readFileSync(path, 'utf8')) as unknown)
+    return normalizeStore(parseJsonDocument(readFileSync(path, 'utf8')))
   } catch {
     return {}
   }

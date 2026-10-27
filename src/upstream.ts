@@ -30,6 +30,14 @@ export type UpstreamErrorKind =
    * account shortly, or the user switches model.
    */
   | 'model_busy'
+  /**
+   * The upstream has restricted THIS ACCOUNT (business code 11140): every call
+   * it makes is refused with "request illegal / 账号存在异常" until the gateway
+   * lifts the restriction. Distinct from `session_dead` because the sign-in is
+   * intact — a token refresh succeeds and still 11140s — so refreshing is pure
+   * waste and must not happen.
+   */
+  | 'restricted'
   | 'session_dead'
   | 'not_found'
   | 'server'
@@ -308,12 +316,21 @@ function isAbortError(error: unknown): boolean {
 /** Cap on the reassembled compaction reply, guarding against a runaway stream. */
 const COMPLETION_TEXT_LIMIT = 64 * 1024
 
-/** Insufficient-credit markers, ASCII lowercase plus the original Chinese. */
+/** Insufficient-credit markers, ASCII lowercase plus the original Chinese.
+ *
+ *  The last two entries are the gateway's OWN 14018 text, added after reading it
+ *  off the wire: the international gateway says "Credits exhausted." (plural)
+ *  and the domestic one says "额度已用尽" — one extra 已 on the phrasing already
+ *  listed. Neither matched, and because the marker scan runs BEFORE the HTTP-429
+ *  branch, a real "you have no credits left" was classified `soft_rate`: the
+ *  pool cooled that one model for 60s and reported a queue, so the user waited
+ *  out a limit that never resets. `credit exhausted` does not cover
+ *  `credits exhausted` either — the plural `s` breaks the substring. */
 const HARD_CREDIT_MARKERS = [
-  'insufficient credit', 'no credit', 'credit exhausted', 'out of credit',
-  'quota exceeded', 'quota exhaust', 'payment required', 'credit not enough',
-  'not enough credit',
-  '积分不足', '额度不足', '余额不足', '积分用完', '额度用尽', '没有积分',
+  'insufficient credit', 'no credit', 'credit exhausted', 'credits exhausted',
+  'out of credit', 'quota exceeded', 'quota exhaust', 'payment required',
+  'credit not enough', 'not enough credit',
+  '积分不足', '额度不足', '余额不足', '积分用完', '额度用尽', '额度已用尽', '没有积分',
 ]
 
 /** Session-invalidation markers that mean "this credential is dead; use another".
@@ -353,6 +370,39 @@ const MODEL_BUSY_BUSINESS_CODE = 14003
  * would put a genuine rate limit back into the "retry, never cool" path.
  */
 const MODEL_BUSY_PATTERN = /模型繁忙|请求量饱和|model\s+busy|currently\s+saturated/iu
+
+/**
+ * Business code and wordings for "this account is restricted by the gateway".
+ *
+ * The international gateway answers a restricted account with HTTP 403 and
+ * `{"code":11140,"msg":"request illegal","displayMsg":{"en":"Your account has
+ * been restricted due to unusual activity"}}`. The status alone cannot carry
+ * the meaning: a genuine revoked sign-in is also 403, and the two demand
+ * opposite handling — one re-signs, the other waits for the gateway. Left
+ * unseparated, a restricted account was read as a dead session, refreshed (which
+ * succeeds and changes nothing), then cooled exactly like a revoked one while
+ * the pool reported "sign-in was revoked" and DSH rendered "API 密钥无效".
+ */
+const RESTRICTED_BUSINESS_CODE = 11140
+
+/**
+ * Wordings that carry the same meaning when the code is absent.
+ *
+ * `request illegal` is deliberately absent: the same gateway uses it as the
+ * `msg` of business code 11128, a fixable request-shape rejection. Matching it
+ * would cool a healthy account over a header the caller forgot to send.
+ */
+const RESTRICTED_MARKERS = [
+  'account has been restricted',
+  'restricted due to unusual activity',
+  '账号存在异常',
+  '账号被限制',
+]
+
+/** Is this body an account restriction rather than a dead credential? */
+function isRestrictedBody(body: string): boolean {
+  return hasBusinessCode(body, RESTRICTED_BUSINESS_CODE) || hasMarker(body, RESTRICTED_MARKERS)
+}
 
 /** Does this body carry the model-saturation business code (or its wording)? */
 function isModelBusyBody(body: string): boolean {
@@ -815,6 +865,10 @@ function contentOfFrame(frame: string): string {
  */
 export function classifyUpstreamError(status: number, body: string): UpstreamErrorKind {
   if (status === 402) return 'hard_credit'
+  // Must precede the 401/403 rule below: a restricted account arrives as 403
+  // and would otherwise be read as a revoked sign-in, which spends a token
+  // refresh on it and reports the wrong cause to the user.
+  if (isRestrictedBody(body)) return 'restricted'
   // An HTTP 401/403 from either gateway means THIS credential is no longer
   // accepted — a stale sign-in, a revoked token, or a key the upstream has
   // dropped. It says nothing about the other accounts in the pool, so it must
@@ -1403,8 +1457,24 @@ export class WorkBuddyUpstreamClient {
    * force `stream: true` (the upstream rejects non-streaming), convert the
    * DSH `developer` role into `system` (upstream rejects `developer` with
    * business code 11128), guarantee a `system` message leads the array (the
-   * gateway rejects anything else with 11128 too — see below), and flatten
-   * `tool_choice` into its string form.
+   * gateway rejects anything else with 11128 too — see below), flatten
+   * `tool_choice` into its string form, and default `reasoning_effort` to
+   * `none` when the caller did not choose one.
+   *
+   * That last default is not cosmetic. `hy3` ships with
+   * `reasoning.defaultEffort: "high"` and `canDisableThinking: false`, so a
+   * request with no effort at all spends the ENTIRE `max_tokens` budget on
+   * `reasoning_content`: measured 4,694 / 11,462 / 27,597 reasoning tokens at
+   * 1k / 3k / 8k budgets, `content` empty, `finish_reason: length` — a reply
+   * that looks like a hang. `step-5-preview` does the same. Only the top-level
+   * `reasoning_effort` moves it; `thinking: {type}`, `reasoning: {effort}`,
+   * `chat_template_kwargs.enable_thinking` and a bare `enable_thinking` were
+   * all tried against the live gateway and all ignored. `none` was then sent to
+   * every other advertised model (18 of them, paid and alias rows included) and
+   * every one answered 200, so defaulting it costs no model anything.
+   *
+   * An effort the caller DID send is left untouched — this only fills the gap,
+   * which is what keeps a user's explicit thinking level meaningful.
    */
   prepareChatBody(raw: string): string {
     let body: unknown
@@ -1428,6 +1498,11 @@ export class WorkBuddyUpstreamClient {
       : {}
     requested['include_usage'] = true
     obj['stream_options'] = requested
+    // Fill the gap only: an explicit effort from the caller always wins.
+    const effort = obj['reasoning_effort']
+    if (effort === undefined || (typeof effort === 'string' && effort.trim() === '')) {
+      obj['reasoning_effort'] = 'none'
+    }
     if (Array.isArray(obj['messages'])) {
       for (const value of obj['messages']) {
         if (typeof value !== 'object' || value === null || Array.isArray(value)) continue

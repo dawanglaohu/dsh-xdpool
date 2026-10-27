@@ -68,6 +68,35 @@ describe('classifyUpstreamError — recoverable classes must rotate', () => {
     expect(classifyUpstreamError(400, '积分不足')).toBe('hard_credit')
   })
 
+  it('reads the gateway\'s own 14018 wording, which arrives as an HTTP 429', () => {
+    // Both bodies below are copied off the wire. The status says 429 and the body
+    // says "no credits left", and the marker scan runs before the 429 branch —
+    // so a missing marker here is not a cosmetic miss: the pool cools ONE model
+    // for 60s and the caller is told to wait for a limit that never resets.
+    // `credit exhausted` did not cover `Credits exhausted` (the plural s), and
+    // `额度用尽` did not cover `额度已用尽` (one extra 已).
+    const intl = JSON.stringify({
+      error: {
+        data: {
+          code: 14018,
+          msg: 'Credits exhausted. Please visit the link below to purchase add-on packs and get more credits: https://www.codebuddy.ai/profile/usage ',
+          requestId: 'x',
+        },
+      },
+    })
+    const cn = JSON.stringify({
+      error: {
+        data: {
+          code: 14018,
+          msg: '额度已用尽，请访问以下链接，购买加量包以获取更多额度：https://www.codebuddy.cn/profile/usage ',
+          requestId: 'x',
+        },
+      },
+    })
+    expect(classifyUpstreamError(429, intl)).toBe('hard_credit')
+    expect(classifyUpstreamError(429, cn)).toBe('hard_credit')
+  })
+
   it('still routes rate limits to soft_rate', () => {
     expect(classifyUpstreamError(429, '')).toBe('soft_rate')
     expect(classifyUpstreamError(400, '"code":6004')).toBe('soft_rate')

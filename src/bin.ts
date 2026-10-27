@@ -24,6 +24,7 @@ import {
 } from './accounts.ts'
 import { WORKBUDDY_APP_EXECUTABLE_ENV, workbuddyAppExecutableCandidates } from './at-rest.ts'
 import { createCore } from './index.ts'
+import { parseJsonDocument } from './json-file.ts'
 import { ignoreAccount, readIgnoredAccounts, unignoreAccount } from './ignored.ts'
 import { readPreferredId, writePreferredId } from './preferred.ts'
 import { formatRates, formatStatus } from './status.ts'
@@ -99,7 +100,7 @@ function liveCandidates(): string[] {
 
 async function readJsonFile(path: string): Promise<unknown | undefined> {
   try {
-    return JSON.parse(await readFile(path, 'utf8')) as unknown
+    return parseJsonDocument(await readFile(path, 'utf8'))
   } catch {
     return undefined
   }

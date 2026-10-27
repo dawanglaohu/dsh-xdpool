@@ -22,6 +22,7 @@ import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
 import { readFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { pluginDataDir } from './ignored.ts'
+import { parseJsonDocument } from './json-file.ts'
 
 /** File holding the preferred account id, inside the plugin data directory. */
 export const PREFERRED_FILE_NAME = 'preferred.json'
@@ -57,7 +58,7 @@ function normalize(raw: unknown): string | undefined {
  */
 export async function readPreferredId(path: string = preferredIdPath()): Promise<string | undefined> {
   try {
-    return normalize(JSON.parse(await readFile(path, 'utf8')) as unknown)
+    return normalize(parseJsonDocument(await readFile(path, 'utf8')))
   } catch {
     return undefined
   }
@@ -75,7 +76,7 @@ export async function readPreferredId(path: string = preferredIdPath()): Promise
  */
 export function readPreferredIdSync(path: string = preferredIdPath()): string | undefined {
   try {
-    return normalize(JSON.parse(readFileSync(path, 'utf8')) as unknown)
+    return normalize(parseJsonDocument(readFileSync(path, 'utf8')))
   } catch {
     return undefined
   }

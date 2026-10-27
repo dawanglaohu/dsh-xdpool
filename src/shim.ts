@@ -141,6 +141,13 @@ const KIND_STATUS: Readonly<Record<UpstreamErrorKind, number>> = {
   // pool is penalised for it, so the 429 here reports model saturation rather
   // than account exhaustion.
   model_busy: 429,
+  // A restricted account gets 429, NOT the 403 the gateway itself answered.
+  // The status is what the Harness reads first: its classifier turns any error
+  // whose text mentions 401/403 into AUTH, which the chat UI renders as
+  // "本轮运行失败 API 密钥无效" — a message about a key that is provably valid.
+  // A rate-limit answer keeps the caller on the retry path, which is also the
+  // correct advice: the restriction is the gateway's to lift, not the user's.
+  restricted: 429,
   session_dead: 401,
   not_found: 502,
   server: 502,
@@ -185,6 +192,23 @@ function writeJson(res: ServerResponse, status: number, body: unknown): void {
 }
 function writeOpenAIError(res: ServerResponse, status: number, kind: string, message: string): void {
   writeJson(res, status, { error: { message, type: kind, code: kind } })
+}
+/**
+ * The message for "every account in this gateway is restricted by the upstream".
+ *
+ * Deliberately free of the digits 401/403, of the word "unauthorized" and of
+ * "invalid request": the Harness classifies an error by its TEXT, and any of
+ * those turns the turn into AUTH, which the chat UI titles "API 密钥无效" — a
+ * claim about a key that is provably valid (a token refresh on a restricted
+ * account succeeds). The gateway's own 11140 wording is quoted instead, since
+ * that is the one fact the user can act on or wait out.
+ */
+function restrictedMessage(restricted: number, total: number): string {
+  return `${restricted}/${total} WorkBuddy account(s) for this gateway are restricted by the upstream gateway `
+    + '(business code 11140, "request illegal" — it reports unusual account activity); '
+    + 'their sign-in is intact and no key is wrong, so signing in again will not help. '
+    + 'The gateway lifts a restriction on its own schedule: retry shortly, add another account, '
+    + 'or switch to a model served by the other gateway.'
 }
 /**
  * Ceiling on the `max_tokens` the compaction summariser may ask for.
@@ -777,8 +801,15 @@ function withBareModelId(raw: string, modelId: string): string {
           const why = pool.unavailableReason(member.modelId, region)
           last = {
             kind: why.reason,
-            status: why.reason === 'cooling' ? 429 : 401,
-            message: `member ${member.modelId} has no usable WorkBuddy account (${why.reason})`,
+            // A restricted member must not answer 401 here either: this status
+            // travels into the chain's terminal error, and the Harness reads the
+            // digits as an auth failure.
+            status: why.reason === 'cooling' || why.reason === 'restricted'
+              ? KIND_STATUS.restricted
+              : 401,
+            message: why.reason === 'restricted'
+              ? `${restrictedMessage(why.restricted, why.total)} (member ${member.modelId})`
+              : `member ${member.modelId} has no usable WorkBuddy account (${why.reason})`,
           }
           continue
         }
@@ -806,6 +837,7 @@ function withBareModelId(raw: string, modelId: string): string {
         }
         last = { kind: result.kind, status: result.status, message: result.message }
         if (result.kind === 'soft_rate') pool.penalize(account.id, parseRateLimitReset(result.message), member.modelId)
+        else if (result.kind === 'restricted') pool.penalizeRestricted(account.id)
         else if (result.kind === 'session_dead') pool.penalizeCredentialDead(account.id)
         else if (result.kind === 'hard_credit') pool.penalizeExhausted(account.id)
         // `model_busy` cools nothing here either. Unlike the single-model lane,
@@ -872,12 +904,18 @@ function withBareModelId(raw: string, modelId: string): string {
       ? ' — that last member\'s MODEL was saturated upstream (14003), not rate-limited; '
         + 'no account was cooled, so retry shortly or reorder the chain'
       : ''
+    // Same reasoning for a restricted member: the chain's own status would
+    // otherwise carry the gateway's 403 digits into an "API 密钥无效" banner.
+    const restrictedNote = last?.kind === 'restricted'
+      ? ' — that last member\'s ACCOUNT is restricted by the gateway (11140); '
+        + 'its sign-in is intact, so reordering the chain or signing in again will not help'
+      : ''
     writeOpenAIError(
       res,
-      status,
+      last?.kind === 'restricted' ? KIND_STATUS.restricted : status,
       `combo_${kind}`,
       `chain ${row.id}: no member answered after ${attempts.length} [${attempts.join(' → ')}]`
-        + `: ${(last?.message ?? 'no member was reachable').slice(0, 300)}${busyNote}`,
+        + `: ${(last?.message ?? 'no member was reachable').slice(0, 300)}${busyNote}${restrictedNote}`,
     )
   }
   /**
@@ -1047,6 +1085,19 @@ function withBareModelId(raw: string, modelId: string): string {
           )
           return
         }
+        if (why.reason === 'restricted') {
+          // Signed in but restricted by the gateway (business code 11140). The
+          // wording and the status both avoid the auth vocabulary on purpose: the
+          // credential is fine here, and 'sign in again' would send the user to a
+          // screen that cannot help.
+          writeOpenAIError(
+            res,
+            KIND_STATUS.restricted,
+            'restricted',
+            restrictedMessage(why.restricted, why.total),
+          )
+          return
+        }
         writeOpenAIError(
           res,
           401,
@@ -1094,6 +1145,18 @@ function withBareModelId(raw: string, modelId: string): string {
       // so the next attempt rotates instead of landing on it again — without
       // this, every one of `maxAttempts` hit the same dead account while healthy
       // accounts were never tried.
+      // A restricted account is NOT a stale one: the gateway hands its token
+      // refresh a brand-new access token and then refuses every chat call with
+      // 11140 anyway, so the refresh below would be paid for nothing and the
+      // account would come back on the very next attempt. Cool it and rotate.
+      if (result.kind === 'restricted') {
+        pool.penalizeRestricted(account.id)
+        logger?.warn(
+          `dsh-xdpool: ${account.label} is restricted by the upstream gateway (11140) `
+            + `(attempt ${attempt + 1}/${maxAttempts}); rotating without refreshing the token`,
+        )
+        continue
+      }
       if (result.kind === 'session_dead') {
         logger?.warn(`dsh-xdpool: ${account.label} session dead; refreshing token and retrying`)
         const before = account.credential.accessToken
@@ -1217,6 +1280,22 @@ function withBareModelId(raw: string, modelId: string): string {
           + `on ${tried[0] ?? 'the pool'}; `
           + 'this is the MODEL queue, not your quota — every account in the pool would be refused too. '
           + 'Switch to another model, or retry shortly; no account was cooled and nothing needs re-signing in. '
+          + `Upstream said: ${last.message.slice(0, 240)}`,
+      )
+      return
+    }
+    // Same reasoning as the saturated-model branch above, for the one other
+    // failure whose fix is not "another credential": a restriction covers every
+    // account the caller can reach, so the generic line — which prints the
+    // upstream status and therefore reads as an auth failure — would be actively
+    // misleading.
+    if (last.kind === 'restricted') {
+      const why = pool.unavailableReason(modelId, region)
+      writeOpenAIError(
+        res,
+        KIND_STATUS.restricted,
+        'restricted',
+        `${restrictedMessage(why.restricted, why.total)} Tried ${tried.length} account(s) [${tried.join(' → ')}]. `
           + `Upstream said: ${last.message.slice(0, 240)}`,
       )
       return
@@ -1683,6 +1762,12 @@ async function recoverFromContextOverrun(options: RecoverOptions): Promise<Recov
         }
       }
       return { ok: false, detail: `upstream ${result.kind} after compaction` }
+    }
+    if (result.kind === 'restricted') {
+      // Same rule as the main loop: no refresh (the gateway renews a restricted
+      // account's token happily and still refuses its calls), just cool it.
+      pool.penalizeRestricted(account.id)
+      continue
     }
     if (result.kind === 'session_dead') {
       // Same rule as the main loop: try a refresh, and if the credential is

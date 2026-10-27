@@ -17,6 +17,7 @@ import { mkdir, readFile, rename, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import type { WorkBuddyAccount, WorkBuddyCredential } from './accounts.ts'
 import { PLUGIN_DATA_DIR_NAME, dshHome } from './ignored.ts'
+import { parseJsonDocument } from './json-file.ts'
 
 /** File name of the durable account list, inside the plugin data directory. */
 export const ACCOUNTS_FILE_NAME = 'accounts.json'
@@ -86,12 +87,7 @@ export async function loadStoredAccounts(path: string): Promise<StoredAccount[]>
   } catch {
     return []
   }
-  let parsed: unknown
-  try {
-    parsed = JSON.parse(text)
-  } catch {
-    return []
-  }
+  const parsed = parseJsonDocument(text)
   const entries = (parsed as { accounts?: unknown } | null)?.['accounts']
   if (!Array.isArray(entries)) return []
   const out: StoredAccount[] = []

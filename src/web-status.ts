@@ -801,6 +801,8 @@ function toWebAccount(
   const cooling = account.cooldownUntilMs > now
   const deadUntil = account.credentialDeadUntilMs ?? 0
   const credentialDead = deadUntil > now
+  const restrictedUntil = account.restrictedUntilMs ?? 0
+  const restricted = restrictedUntil > now
   const modelCooldowns = Object.entries(account.modelCooldowns)
     .filter(([, until]) => until > now)
     .sort((a, b) => a[1] - b[1])
@@ -817,6 +819,8 @@ function toWebAccount(
     ...cooling ? { cooldownUntil: new Date(account.cooldownUntilMs).toISOString() } : {},
     credentialDead,
     ...credentialDead ? { credentialDeadUntil: new Date(deadUntil).toISOString() } : {},
+    restricted,
+    ...restricted ? { restrictedUntil: new Date(restrictedUntil).toISOString() } : {},
     ...modelCooldowns.length === 0 ? {} : { modelCooldowns },
     disabled,
     preferred,

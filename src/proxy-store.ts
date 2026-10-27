@@ -23,6 +23,7 @@ import { mkdir, readFile, rename, writeFile } from 'node:fs/promises'
 import { readFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { pluginDataDir } from './ignored.ts'
+import { parseJsonDocument } from './json-file.ts'
 import { parseProxyUrl } from './proxy-fetch.ts'
 
 /** File holding the per-account proxy table, inside {@link pluginDataDir}. */
@@ -90,7 +91,7 @@ function normalizeTable(raw: unknown): ProxyTable {
 /** Read the table, tolerating every "nothing configured yet" shape. */
 export async function readProxies(path: string = proxiesPath()): Promise<ProxyTable> {
   try {
-    return normalizeTable(JSON.parse(await readFile(path, 'utf8')) as unknown)
+    return normalizeTable(parseJsonDocument(await readFile(path, 'utf8')))
   } catch {
     return {}
   }
@@ -106,7 +107,7 @@ export async function readProxies(path: string = proxiesPath()): Promise<ProxyTa
  */
 export function readProxiesSync(path: string = proxiesPath()): ProxyTable {
   try {
-    return normalizeTable(JSON.parse(readFileSync(path, 'utf8')) as unknown)
+    return normalizeTable(parseJsonDocument(readFileSync(path, 'utf8')))
   } catch {
     return {}
   }

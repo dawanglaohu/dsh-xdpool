@@ -201,7 +201,15 @@ type UpstreamErrorKind = 'hard_credit' |
  * class must neither cool anything nor rotate: the caller re-asks the same
  * account shortly, or the user switches model.
  */
-'model_busy' | 'session_dead' | 'not_found' | 'server' | 'client' |
+'model_busy' |
+/**
+ * The upstream has restricted THIS ACCOUNT (business code 11140): every call
+ * it makes is refused with "request illegal / 账号存在异常" until the gateway
+ * lifts the restriction. Distinct from `session_dead` because the sign-in is
+ * intact — a token refresh succeeds and still 11140s — so refreshing is pure
+ * waste and must not happen.
+ */
+'restricted' | 'session_dead' | 'not_found' | 'server' | 'client' |
 /**
  * The request outgrew the model's context window (business code 11115). The
  * transcript is intact — compacting it and retrying the same account is the
@@ -555,8 +563,24 @@ export declare class WorkBuddyUpstreamClient {
    * force `stream: true` (the upstream rejects non-streaming), convert the
    * DSH `developer` role into `system` (upstream rejects `developer` with
    * business code 11128), guarantee a `system` message leads the array (the
-   * gateway rejects anything else with 11128 too — see below), and flatten
-   * `tool_choice` into its string form.
+   * gateway rejects anything else with 11128 too — see below), flatten
+   * `tool_choice` into its string form, and default `reasoning_effort` to
+   * `none` when the caller did not choose one.
+   *
+   * That last default is not cosmetic. `hy3` ships with
+   * `reasoning.defaultEffort: "high"` and `canDisableThinking: false`, so a
+   * request with no effort at all spends the ENTIRE `max_tokens` budget on
+   * `reasoning_content`: measured 4,694 / 11,462 / 27,597 reasoning tokens at
+   * 1k / 3k / 8k budgets, `content` empty, `finish_reason: length` — a reply
+   * that looks like a hang. `step-5-preview` does the same. Only the top-level
+   * `reasoning_effort` moves it; `thinking: {type}`, `reasoning: {effort}`,
+   * `chat_template_kwargs.enable_thinking` and a bare `enable_thinking` were
+   * all tried against the live gateway and all ignored. `none` was then sent to
+   * every other advertised model (18 of them, paid and alias rows included) and
+   * every one answered 200, so defaulting it costs no model anything.
+   *
+   * An effort the caller DID send is left untouched — this only fills the gap,
+   * which is what keeps a user's explicit thinking level meaningful.
    */
   prepareChatBody(raw: string): string;
   /**
@@ -950,6 +974,19 @@ interface WorkBuddyAccount {
    * `0`/undefined means "not known to be dead".
    */
   credentialDeadUntilMs?: number;
+  /**
+   * Epoch ms until which this account is skipped because the upstream RESTRICTED
+   * it (business code 11140, "request illegal / 账号存在异常"), not because its
+   * sign-in is gone.
+   *
+   * Kept apart from {@link credentialDeadUntilMs} because the two need opposite
+   * handling: a dead sign-in is revived by refreshing/signing in, while a
+   * restricted account answers the token refresh with a new, perfectly valid
+   * token and still refuses every chat call. Marking it dead therefore spent a
+   * refresh per request AND told the user to sign in again — advice that cannot
+   * help. `0`/undefined means "not known to be restricted".
+   */
+  restrictedUntilMs?: number;
 }
 /**
  * Platform-default directories holding the desktop app's auth files.
@@ -990,6 +1027,12 @@ interface AccountPoolOptions {
    * (default 30 minutes). Only a fresh sign-in in the desktop app clears it.
    */
   credentialDeadCooldownMs?: number;
+  /**
+   * How long an account rests after the upstream restricts it (default one
+   * hour). Distinct from the credential-dead rest because a restriction cannot
+   * be fixed by signing in.
+   */
+  restrictedCooldownMs?: number;
   /** Upstream client used to refresh near-expiry tokens. */
   client?: TokenRefresher;
   /** Refresh this long before actual expiry; default five minutes. */
@@ -1043,6 +1086,12 @@ export declare class WorkBuddyAccountPool {
    * sign-in. Cleared by a newer credential file or an explicit sign-in.
    */
   private credentialDeadCooldownMs;
+  /**
+   * How long an account stays out of rotation after the upstream restricted it
+   * (business code 11140). Cleared by a newer credential file, an explicit
+   * sign-in, or a call that succeeds again.
+   */
+  private restrictedCooldownMs;
   private readonly client;
   private readonly refreshMarginMs;
   private accounts;
@@ -1238,7 +1287,9 @@ export declare class WorkBuddyAccountPool {
     disabled: number;
     /** Accounts skipped because the upstream rejected their sign-in. */
     dead: number;
-    reason: 'empty' | 'cooling' | 'disabled' | 'reserve' | 'session_dead' | 'none';
+    /** Accounts skipped because the upstream restricted them (business code 11140). */
+    restricted: number;
+    reason: 'empty' | 'cooling' | 'disabled' | 'reserve' | 'session_dead' | 'restricted' | 'none';
   };
   /** Round-robin: the legacy cursor walk, kept for the distribution that asks for it. */
   private pickRoundRobin;
@@ -1421,6 +1472,23 @@ export declare class WorkBuddyAccountPool {
   /** Accounts currently kept out of rotation because their sign-in was rejected. */
   deadCredentials(): readonly WorkBuddyAccount[];
   /**
+   * Cool a whole account because the upstream RESTRICTED it (business code
+   * 11140), which is not the same event as a rejected sign-in and must not be
+   * recorded as one.
+   *
+   * The credential is intact — a token refresh on a restricted account returns a
+   * brand-new access token and every chat call still answers 11140 — so the
+   * account is set aside purely on time. Calling {@link penalizeCredentialDead}
+   * here instead cost one refresh per request and told the user their sign-in
+   * had been revoked, which both wasted the retry budget and pointed at a fix
+   * (sign in again) that provably does nothing.
+   */
+  penalizeRestricted(accountId: string): void;
+  /** Put an account back in rotation after the upstream stopped restricting it. */
+  clearRestricted(accountId: string): void;
+  /** Accounts currently kept out of rotation because the upstream restricted them. */
+  restrictedAccounts(): readonly WorkBuddyAccount[];
+  /**
    * Refresh the account's access token when it is within the margin (or already
    * expired), in-flight de-duped per account. A failed refresh keeps the
    * existing token when it has not yet expired, so an unreachable refresh
@@ -1462,6 +1530,7 @@ export declare class WorkBuddyAccountPool {
     count: number;
     cooling: number;
     dead: number;
+    restricted: number;
     lastScanAtMs: number;
   };
 }
@@ -1864,6 +1933,17 @@ interface PoolWebAccount {
   credentialDead?: boolean;
   /** ISO timestamp when the dead mark expires and the account is retried; only while `credentialDead`. */
   credentialDeadUntil?: string;
+  /**
+   * The upstream RESTRICTED this account (business code 11140, "request illegal
+   * / 账号存在异常") — every call it makes is refused until the gateway relents.
+   *
+   * Kept apart from {@link credentialDead} on purpose: the sign-in is intact and
+   * a token refresh on such an account succeeds, so "Sign-in rejected / sign in
+   * again" is the one piece of advice that cannot help here.
+   */
+  restricted?: boolean;
+  /** ISO timestamp when the restriction is re-tested; only while `restricted`. */
+  restrictedUntil?: string;
   /**
    * Per-model cooldowns currently active. The account is NOT `cooling` while a
    * model is limited — its other models still serve — but each entry tells the

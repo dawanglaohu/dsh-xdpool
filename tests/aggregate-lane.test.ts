@@ -42,7 +42,7 @@ function poolCatalog(): WorkBuddyCatalog {
 function poolWith(acquire: () => Promise<unknown>): WorkBuddyAccountPool {
   return {
     acquire,
-    unavailableReason: () => ({ total: 0, cooling: 0, disabled: 0, reason: 'empty' }),
+    unavailableReason: () => ({ total: 0, cooling: 0, disabled: 0, dead: 0, restricted: 0, reason: 'empty' }),
     noteServed: () => {},
   } as unknown as WorkBuddyAccountPool
 }

@@ -47,10 +47,11 @@ export const PROBE_TIMEOUT_MS = 30_000
 /**
  * The smallest prompt that makes a model answer in a few characters.
  *
- * Deliberately a counting question rather than a greeting: "how many r's are in
- * strawberry" forces real generation on any model, whereas "hi" can be answered
- * from a cache or a canned reply on some gateways, which would make the probe
- * report a working connection to a model that is not actually reachable.
+ * Deliberately an instruction rather than a greeting: "hi" can be answered from
+ * a canned reply on some gateways, which would let the probe report a working
+ * connection to a model that is not actually reachable, while "reply with the
+ * single word: ready" is short enough to cost 24 tokens and specific enough
+ * that the answer has to come from the model.
  */
 const PROBE_PROMPT = 'Reply with the single word: ready'
 
@@ -61,12 +62,31 @@ interface ProbeChunk {
   reason?: unknown
 }
 
+/**
+ * One content block, as the host accepts it.
+ *
+ * Typed rather than `unknown` on purpose: the bug this replaced was a bare
+ * string where the host wanted blocks, and a structural type is the difference
+ * between the compiler catching that and a user catching it. Only the text
+ * variant is ever produced here.
+ */
+export interface ProbeTextBlock {
+  type: 'text'
+  text: string
+}
+
+/** One message in the probe's history. */
+export interface ProbeMessage {
+  role: 'user'
+  content: ProbeTextBlock[]
+}
+
 /** The slice of the host's `llm` service this module needs. */
 export interface ModelProbeStream {
   stream(options: {
     provider: string
     model: string
-    messages: unknown[]
+    messages: ProbeMessage[]
     system?: string
     maxTokens?: number
     signal?: AbortSignal
@@ -110,7 +130,12 @@ export async function probeModelConnectivity(
       provider,
       model,
       system: 'You are being called by a connection test. Answer in one short word.',
-      messages: [{ role: 'user', content: PROBE_PROMPT }],
+      // Content is a BLOCK ARRAY, not a bare string. The host's history
+      // validator walks `message.content.some(...)` (dsh-llm-pi-ai's
+      // assertSupportedHistory, dsh-llm's contentHasImage), so a string here
+      // throws "content.some is not a function" before any request is made and
+      // the card shows a connection test that cannot connect to anything.
+      messages: [{ role: 'user', content: [{ type: 'text', text: PROBE_PROMPT }] }],
       maxTokens: PROBE_MAX_TOKENS,
       signal: timeout.signal,
     })

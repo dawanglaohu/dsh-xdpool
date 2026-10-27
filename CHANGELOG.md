@@ -1,6 +1,82 @@
 # Changelog
 本项目的所有重要变更都会记录在此文件。
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
+## 2.4.8 — 两份手改文件被 Windows 加了 BOM，插件把其中一份读成了「什么都没配」
+> 2.4.7 修完 11140 之后，用户重启，国际版报错消失了，但两件事露了出来。一是**账号锁定在重启后没有生效**：`C:\Users\admin\.dsh\.xdpool\preferred.json` 是 47 字节，头三个是 `EF BB BF`，后 44 个是一份完全正确的 `{"version":1,"accountId":"73349e22201eddc4"}` —— `JSON.parse` 拒绝这个前缀，四个读者各自把异常吞成自己的空值，于是「已锁定哪一路账号」这个设置静默失效，卡片上 `preferredAccountId` 是 undefined。二是**模型连接测试直接崩**：`POST /plugins/dsh-xdpool/model/test` 返回 `{"ok":false,"outputChars":0,"error":"content.some is not a function"}`。
+
+### BOM 属于编码，不属于文档
+新增 `src/json-file.ts`：`stripBom()` 只剥一个前导 U+FEFF（两个 mark 不是任何编辑器会写出的东西，第二个是文档内容），`parseJsonDocument()` 在其上剥空白、空文档给 `undefined`、解析失败也给 `undefined`。所有插件自有文件的读者改走它：`src/preferred.ts:60`/`:78`（锁定的账号）、`src/ignored.ts`（忽略名单）、`src/proxy-store.ts`（代理表）、`src/account-store.ts`（`accounts.json` —— 这里中招等于整池清空）、`src/store.ts`（聚合设置）、`src/accounts.ts`（`parseWorkBuddyAuth` / `cheapIdentityId`，未来桌面端若写 BOM，账号会被当成未登录）、`src/bin.ts`（`import` 的输入）。
+
+网络与协议报文**没有**动（`src/upstream.ts`、`src/aggregate.ts`、`src/shim.ts` 的 SSE 帧、`src/web-status.ts` 的 HTTP 正文、`src/billion.ts` 的代理状态、`src/at-rest.ts` 的 base64 信封）：BOM 是本地文本文件的产物，对端不会发。
+
+### 连接测试的消息必须是 block 数组
+`src/model-probe.ts:113` 原来把 `PROBE_PROMPT` 直接当 `content` 传字符串。harness 的 `assertSupportedHistory`（`dsh-llm-pi-ai/lib/index.js:1213-1217`）和 `contentHasImage`（`dsh-llm/lib/types/content.js:93-95`）都会 `content.some(...)`，字符串没有这个方法，探针在发请求之前就抛了。现在传 `[{ type: 'text', text: PROBE_PROMPT }]`，并把 `ModelProbeStream` 的 `messages` 从 `unknown[]` 收紧成 `ProbeMessage[]`（`ProbeTextBlock` / `ProbeMessage` 两个导出接口），下次写回字符串 `tsc` 就会拦下。
+
+### 回归
+`tests/json-file-bom.test.ts`（8 条）：`stripBom` 只剥一个 mark；带 BOM 的正常文档可解析、真正损坏的仍是 `undefined`、只有 BOM 的文件等同空文件；`readPreferredId` 与其同步版都能从实测形状 `BOM + {\n  "version": 1,\n  "accountId": "acct-7"\n}\n` 读出 `acct-7`；忽略名单、代理表、`loadStoredAccounts`、聚合设置（临时 `DSH_HOME`）、`parseWorkBuddyAuth`/`cheapIdentityId` 各一条。
+
+`tests/model-probe-content.test.ts`（3 条）：假 `llm` 按 harness 的方式校验 `content.some(...)`（这一行就是原来崩的地方），健康的探针要报 `ok: true` 且发出去的 `content` 是 block 数组；host 侧抛错要变成 `ok: false` + 原文，而不是冒泡；空回答要报成失败。
+
+基线 82 files / 1,065 tests → 84 files / 1,076 tests 全通过；`npx tsc -p tsconfig.json --noEmit` 干净。
+## 2.4.7 — 国际版账号被上游限制，插件以前把它读成「登录已失效」
+> 现象是 `本轮运行失败 API 密钥无效`，但账号一个都没掉线。实测 9 个国际版账号里 4 个被网关限制：HTTP **403** + `{"code":11140,"msg":"request illegal","displayMsg":{"en":"Your account has been restricted due to unusual activity"}}`。同一批 token 拿去打 `/v2/plugin/auth/token/refresh` 仍然 200 并换出一枚新 token，再拿新 token 打 `/v2/chat/completions` 依旧 403 —— 也就是说「刷新登录」这一步对这类账号是纯无效劳动。而 `classifyUpstreamError` 把一切 401/403 判成 `session_dead`，shim 翻成 HTTP 401 `session_dead`，pi-ai 把状态码拼进错误正文，harness 的 `classifyPiAiError` 见到 `401|403` 就判 `AUTH`，UI 于是印刷「API 密钥无效」。
+
+### 一个业务码、一组措辞，各归各位
+`src/upstream.ts:386-399`。新增 `restricted` 错误类，判据是业务码 `11140` 或「账号被限制」这句话（`account has been restricted` / `restricted due to unusual activity` / `账号存在异常` / `账号被限制`）。判据排在 `if (status === 401 || status === 403) return 'session_dead'`（`src/upstream.ts:878`）**之前**，所以真被吊销的登录（裸 403、`forbidden`、`api key is invalid`）仍然走 `session_dead` 去重登，只有网关明说「账号异常」的才另立一类。
+
+`request illegal` **没有**进措辞表：它是 `msg` 字段，11128「请求形状不合规」也用它，把它算作限制会让一个真实可修的报文错误去冷却一个健康账号。回归里钉了这条：`classifyUpstreamError(400, '{"code":11128,…}')` 必须是 `client`。
+
+### 被限制的账号只冷却，不刷新
+`src/shim.ts:1152-1159`、`src/accounts.ts:1586-1618`。旧路径在 `session_dead` 下会先 `refreshAccount(force)` 再比对 token 有没有变，对被限制的账号这是一次必然成功、又一无所获的往返。现在 `restricted` 直接 `pool.penalizeRestricted(account.id)` 然后 `continue`，一个请求只被拒一次就把该账号挪出候选，5 个健康账号照常接活。冷却用独立的 `restrictedUntilMs`（默认 60 分钟，`src/accounts.ts:688`），与「登录失效」的 30 分钟分开计；`ensureFresh` 刷新成功只清 `credentialDead`，不清限制 —— 能刷新恰恰是这类账号的特征，用它当解除证据等于自欺。
+
+### 报错文案不再触发 AUTH 横幅
+`src/shim.ts:196-212`、`src/shim.ts:137-150`。`KIND_STATUS.restricted` 取 **429** 而不是 403：AUTH 是 harness 从错误正文里的状态码数字认出来的，只要那串数字进了正文，写什么措辞都是「密钥无效」。终局文案由 `restrictedMessage()` 单独生成，正文里没有 `401`/`403`，也没有 `unauthorized` / `invalid request` / `network` / `fetch` / `timeout`（后几项会把错误打回 `INVALID_REQUEST` 或 `TRANSPORT`）。它说的是实情：N/M 个账号被网关限制（业务码 11140），登录是好的、密钥没错、重登没用，等网关自己解、加账号、或换到另一侧网关的模型。
+
+### 卡片不再说「登录已被拒绝」
+`src/status-paths.ts:755-764`、`src/web-status.ts:804-823`、`src/client/PoolCard.tsx:2152-2265`、`src/client/locales.ts:74-75`/`612-613`。新增 `restricted` 行状态与 `被上游限制` 徽章，提示语写明「登录状态本身没有问题，重新登录不会解除」。被限制的账号不再走 `/credits` 探测。
+
+### 回归
+`tests/restricted-account.test.ts`（11 条）：真实 11140 报文在 403 与 200 信封下都判 `restricted`；11128 必须判 `client`；裸 403 与四种 401 措辞仍是 `session_dead`；`penalizeRestricted` 只冷却一个账号且 `acquire()` 立刻跳过它；整池被限制时 `unavailableReason().reason === 'restricted'`；被限制的账号**一次刷新都不会被请求**；shim 在首个账号被限制时仍用健康账号给出 200 SSE；整池被限制时回答 429 `restricted`，且正文里既没有 `401|403` 也没有 auth 措辞；卡片行渲染出 `restricted` 而不渲染 `credentialDead`。
+
+基线 81 files / 1,054 tests → 82 files / 1,065 tests 全通过；`npx tsc -p tsconfig.json --noEmit` 干净。
+## 2.4.6 — 额度用完的账号还剩三个模型能用，插件以前一个都看不到
+> 池子里额度归零的账号不是废号。实测下来它们照样能跑 `hy3`、`deepseek-v4.1-flash`、`step-5-preview` 三个模型，网关自己回的 `usage.credit` 是 `0`。但插件把这三行全弄丢了：国际版 `/v3/config` 只广告 13 个模型，这三个一个都不在里面，而 `catalogFromUpstream` 是「有 live 就整份替换」，于是零额度账号打开选择器什么都跑不了。这一版把三件事一起修掉：名册合并、`reasoning_effort` 默认值、以及真实 14018 报文的识别。
+
+### 名册：live 赢，但不再删掉它没提到的行
+`src/catalog.ts:311-337` `catalogFromUpstream` 原来是 `models.map(toModelInfo)` 整份替换。现在 live 里出现过的 id 一律以 live 为准（窗口和倍率是网关自己的数），live 没提到的静态行追加在后面。国际版另有一份 `GLOBAL_WITHHELD_IDS`（`src/catalog.ts:112-124`）把这些 id 排除在合并之外：
+
+| id | `www.workbuddy.ai` 实测 |
+| --- | --- |
+| `hy3-x` | `11102 service info not found` |
+| `deepseek-v4-pro` | 同上 |
+| `deepseek-v4-flash` | 同上 |
+| `kimi-k3-1` | 同上 |
+
+只从合并里排除，静态表本身不动 —— 网关连不上时用户看到的就是那张表，缩表比多一个会被拒的 id 更糟。
+
+### `step-5-preview` 进静态表，参数按实测而不是按 config
+`src/catalog.ts:69-77`。网关 config 声明 `maxOutputTokens: 64000`，但真发 65,536 会 500 `invoke model error`（业务码 10000），60,000 是能过的最大预算，所以表里写 60,000。`credits` 声明 `x0.43`，可两区实测 `usage.credit` 恒为 0，所以用 `multiplier: 0` —— 与 `hy3` 同一套写法，免费徽章由此点亮。
+
+### `reasoning_effort` 默认 `none`
+`src/upstream.ts:1456-1460`。`hy3` 的 config 是 `defaultEffort: "high"` + `canDisableThinking: false`，不指定 effort 时整个 `max_tokens` 全烧进 `reasoning_content`：1k/3k/8k 预算分别产生 4,694 / 11,462 / 27,597 个 reasoning token，`content` 为空、`finish_reason: length`，看起来就是卡死。`step-5-preview` 同样。八种写法里只有顶层 `reasoning_effort` 有效（`thinking: {type}`、`reasoning: {effort}`、`chat_template_kwargs.enable_thinking`、`enable_thinking` 全部被忽略），而 `none` 发给其余 18 个广告模型（含付费与别名行）全部 200，所以默认它不花任何模型的钱。调用方自己指定的值原样保留，这一层只填空。
+
+### 14018 真的是 429，原文里没有旧 marker
+`src/upstream.ts:311-325` 补两个 marker：`credits exhausted`（复数 s，原来的 `credit exhausted` 差一个字母就匹配不上）与 `额度已用尽`（比原来的 `额度用尽` 多一个「已」）。两条报文都是照抄线上的：
+
+| 区 | HTTP | `msg` |
+| --- | --- | --- |
+| 国际 | **429** | `Credits exhausted. Please visit the link below to purchase add-on packs and get more credits: https://www.codebuddy.ai/profile/usage ` |
+| 国内 | **429** | `额度已用尽，请访问以下链接，购买加量包以获取更多额度：https://www.codebuddy.cn/profile/usage ` |
+
+marker 扫描排在 `429 → soft_rate` 那一支之前，所以漏掉这两个词的后果不是少一句提示：整池只把**这一个模型**冷却 60 秒，然后告诉用户「排队中」，让用户去等一个永远不会重置的限流。补上之后按 `hard_credit` 走 `penalizeExhausted`，冷却的是**整个账号** 30 分钟。
+
+### 三处改动各自带了回归
+- `tests/catalog-resilience.test.ts` 新增 D 组四条：未广告的行要在合并后还在、只网关知道的新 id 排在首位、国际版要挡住那四个 `11102`、live 同名行不能被静态行覆盖。
+- `tests/chat-identity-headers.test.ts` 新增一条：不传 effort 落 `none`、传空串也落 `none`、传 `high` 保持 `high`。
+- `tests/upstream-error-classification.test.ts` 新增一条：两条真实 14018 报文（HTTP 429）都判 `hard_credit`。
+
+基线 81 files / 1,048 tests → 81 files / 1,054 tests 全通过；`npx tsc -p tsconfig.json --noEmit` 干净。
+
 ## 2.4.5 — 国内扫码登录认清自己是 WorkBuddy，不再是 CodeBuddy IDE
 > 国内那条渠道的内部代号一直叫 `CODEBUDDY`，于是扫码登录也照着 CodeBuddy IDE 的旧口径发出去：`copilot.tencent.com` + `platform=ide`，而且一个会话参数都不带。真机上国内版扫出来的是 `www.workbuddy.cn/login?platform=workbuddy&version=5.8.3&loginSessionId=…` —— 域名、`platform`、两个会话参数，四项全错。
 

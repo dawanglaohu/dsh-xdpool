@@ -49,11 +49,19 @@ function poolWith(
 ): WorkBuddyAccountPool {
   return {
     acquire,
-    unavailableReason: () => ({ total: unavailable.total ?? 0, cooling: 0, disabled: 0, reason: unavailable.reason }),
+    unavailableReason: () => ({
+      total: unavailable.total ?? 0,
+      cooling: 0,
+      disabled: 0,
+      dead: 0,
+      restricted: 0,
+      reason: unavailable.reason,
+    }),
     noteServed: () => {},
     penalize: () => {},
     penalizeCredentialDead: () => {},
     penalizeExhausted: () => {},
+    penalizeRestricted: () => {},
   } as unknown as WorkBuddyAccountPool
 }
 /** One fake third-party gateway; `answers` decides per request whether it serves. */

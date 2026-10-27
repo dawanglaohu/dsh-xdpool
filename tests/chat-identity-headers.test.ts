@@ -188,4 +188,20 @@ describe('prepareChatBody guarantees the gateway contract', () => {
     expect(roles(raw)).toEqual(['system', 'user'])
     expect(parse(raw)['stream']).toBe(true)
   })
+
+  it('defaults reasoning_effort to none, and never overrides the caller', () => {
+    // Measured on the live gateway: `hy3` and `step-5-preview` both carry
+    // `canDisableThinking: false` and a `defaultEffort` of high, so a request
+    // without an effort spends the whole budget on reasoning_content and returns
+    // an empty `content` with `finish_reason: length`. `none` was then sent to
+    // every other advertised model and all 18 answered 200, so the default costs
+    // no model anything.
+    const bare = JSON.stringify({ model: 'hy3', messages: [{ role: 'user', content: 'hi' }] })
+    expect(parse(bare)['reasoning_effort']).toBe('none')
+    expect(parse(JSON.stringify({ model: 'hy3', messages: [], reasoning_effort: '' }))['reasoning_effort']).toBe('none')
+    // A level the caller actually chose survives untouched, or the setting that
+    // lets a user ask for thinking would do nothing.
+    expect(parse(JSON.stringify({ model: 'hy3', messages: [], reasoning_effort: 'high' }))['reasoning_effort'])
+      .toBe('high')
+  })
 })

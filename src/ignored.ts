@@ -22,6 +22,7 @@ import { readFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 import type { PoolWebIgnoredAccount } from './status-paths.ts'
+import { parseJsonDocument } from './json-file.ts'
 
 /** Directory holding this plugin's own state (imported snapshots, ignore list). */
 export const PLUGIN_DATA_DIR_NAME = '.xdpool'
@@ -92,7 +93,7 @@ function normalize(raw: unknown): IgnoredAccount[] {
  */
 export async function readIgnoredAccounts(path: string = ignoredIdsPath()): Promise<IgnoredAccount[]> {
   try {
-    return normalize(JSON.parse(await readFile(path, 'utf8')) as unknown)
+    return normalize(parseJsonDocument(await readFile(path, 'utf8')))
   } catch {
     return []
   }
@@ -109,7 +110,7 @@ export async function readIgnoredAccounts(path: string = ignoredIdsPath()): Prom
  */
 export function readIgnoredAccountsSync(path: string = ignoredIdsPath()): IgnoredAccount[] {
   try {
-    return normalize(JSON.parse(readFileSync(path, 'utf8')) as unknown)
+    return normalize(parseJsonDocument(readFileSync(path, 'utf8')))
   } catch {
     return []
   }

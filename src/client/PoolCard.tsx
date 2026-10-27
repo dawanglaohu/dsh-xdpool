@@ -2149,6 +2149,7 @@ function AccountBlock({
   const isPreferred = account.preferred === true
   const isCooling = account.cooling === true
   const isDead = account.credentialDead === true
+  const isRestricted = account.restricted === true
   const cooldownUntil = account.cooldownUntil !== undefined ? Date.parse(account.cooldownUntil) : undefined
   const modelCooldowns = account.modelCooldowns ?? []
   // Only a whole-account cooldown gets a tag. Per-model cooldowns do NOT mark
@@ -2162,11 +2163,17 @@ function AccountBlock({
   //
   // A rejected sign-in outranks "cooling": a cooldown lifts on its own, this
   // one needs the user to sign in again, so it is the more useful thing to say.
+  //
+  // A restriction is not a rejected sign-in and must not borrow its tag: the
+  // gateway refuses the account's calls while its credential is perfectly good,
+  // so "Sign-in rejected" would send the user to a screen that cannot fix it.
   const tag = isDead
     ? { text: t?.('row.credentialDeadTag') ?? 'Sign-in rejected', cls: 'dsm-xdpool-account-tag dsm-xdpool-account-tag-dead' }
-    : isCooling
-      ? { text: t?.('row.cooling') ?? 'Cooling', cls: 'dsm-xdpool-account-tag dsm-xdpool-account-tag-cooling' }
-      : null
+    : isRestricted
+      ? { text: t?.('row.restrictedTag') ?? 'Restricted by upstream', cls: 'dsm-xdpool-account-tag dsm-xdpool-account-tag-dead' }
+      : isCooling
+        ? { text: t?.('row.cooling') ?? 'Cooling', cls: 'dsm-xdpool-account-tag dsm-xdpool-account-tag-cooling' }
+        : null
   return (
     <div className={isDisabled ? 'dsm-xdpool-account dsm-xdpool-account-off' : 'dsm-xdpool-account'}
          data-serving={serving === true ? 'true' : undefined}
@@ -2251,6 +2258,11 @@ function AccountBlock({
           {isDead
             ? <span className="dsm-xdpool-account-meta dsm-xdpool-account-meta-dead">
                 {t?.('row.credentialDeadHint') ?? 'Sign in again in the WorkBuddy desktop app to restore it'}
+              </span>
+            : null}
+          {isRestricted
+            ? <span className="dsm-xdpool-account-meta dsm-xdpool-account-meta-dead">
+                {t?.('row.restrictedHint') ?? 'The upstream gateway restricted this account (11140); signing in again does not lift it'}
               </span>
             : null}
           {modelCooldowns.length > 0

@@ -66,6 +66,15 @@ export const FALLBACK_WORKBUDDY_MODELS: readonly WorkBuddyModelInfo[] = [
   { id: 'kimi-k2.7', name: 'Kimi-K2.7-Code', contextWindow: 256_000, maxOutputTokens: 32_000, supportsImages: true, multiplier: 0.57 },
   { id: 'kimi-k2.6', name: 'Kimi-K2.6', contextWindow: 256_000, maxOutputTokens: 32_000, supportsImages: true, multiplier: 0.52 },
   { id: 'minimax-m3', name: 'MiniMax-M3', contextWindow: 512_000, maxOutputTokens: 64_000, supportsImages: true, multiplier: 0.25 },
+  // Not in either gateway's advertised roster, but it answers on both and it is
+  // the one row an exhausted account can still reach. Two measured facts set its
+  // shape rather than the config: the gateway advertises
+  // `maxOutputTokens: 64000` yet a 65,536-token request dies with
+  // `invoke model error` (business code 10000) — 60,000 is the largest budget
+  // that answered — and `usage.credit` came back 0 on every request, in both
+  // regions, which is why it carries the same `multiplier: 0` spelling as `hy3`
+  // instead of the config's `x0.43`.
+  { id: 'step-5-preview', name: 'Step-5-Preview', contextWindow: 1_000_000, maxOutputTokens: 60_000, supportsImages: true, multiplier: 0, supportedEfforts: ['low', 'medium', 'high'] },
 ]
 
 /** Which gateway a catalog describes. Mirrors `WorkBuddyRegion` in `upstream.ts`. */
@@ -99,6 +108,20 @@ const FALLBACK_WORKBUDDY_MODELS_GLOBAL: readonly WorkBuddyModelInfo[] = FALLBACK
     return { ...model, ...(tags.length === 0 ? {} : { tags }) }
   },
 )
+
+/**
+ * Rows the international gateway was measured refusing, so the live merge must
+ * not append them behind a healthy roster.
+ *
+ * They are only withheld from the MERGE. The static fallback itself keeps them
+ * because that table is also what a user with no reachable gateway sees, and an
+ * id that is merely refused today is better than a picker that shrank — which is
+ * the same reasoning the shared roster already rests on. Every id here answered
+ * `11102 service info not found` on `www.workbuddy.ai`.
+ */
+const GLOBAL_WITHHELD_IDS: ReadonlySet<string> = new Set([
+  'hy3-x', 'deepseek-v4-pro', 'deepseek-v4-flash', 'kimi-k3-1',
+])
 
 /** The static fallback table for one region. Defaults to `cn`. */
 export function fallbackModelsFor(region: CatalogRegion = 'cn'): readonly WorkBuddyModelInfo[] {
@@ -285,16 +308,33 @@ export function toModelInfo(model: WorkBuddyUpstreamModel): WorkBuddyModelInfo {
 }
 
 /**
- * Map the live upstream list, falling back to the static list when empty.
+ * Map the live upstream list, keeping the static rows the live one omits.
  *
- * `region` only chooses WHICH static table an empty list falls back to. A
- * non-empty list is the gateway's own answer for whichever gateway was asked,
- * so there is nothing region-specific left to apply to it.
+ * The live list is NOT the whole roster. The international `/v3/config` names
+ * 13 models and not one of them is `hy3`, `deepseek-v4.1-flash` or
+ * `step-5-preview` — the three that answer on a zero-credit account — yet all
+ * three serve requests through the same gateway. Replacing the table with the
+ * live answer therefore deleted exactly the rows an exhausted account depends
+ * on, and the picker offered nothing that could still run.
+ *
+ * So the live list wins on every id it names (its window and rate are the
+ * gateway's own), and any static row it did not mention is appended behind it.
+ * The static row keeps its own fields because nothing better exists for it: the
+ * endpoint that advertises windows simply does not list it.
+ *
+ * `region` still chooses WHICH static table contributes those extras, and on the
+ * international side it also drops the rows that gateway was measured refusing —
+ * see {@link GLOBAL_WITHHELD_IDS}.
  */
 export function catalogFromUpstream(
   models: readonly WorkBuddyUpstreamModel[],
   region: CatalogRegion = 'cn',
 ): readonly WorkBuddyModelInfo[] {
   if (models.length === 0) return fallbackModelsFor(region)
-  return models.map(toModelInfo)
+  const live = models.map(toModelInfo)
+  const named = new Set(live.map(model => model.id))
+  const withheld = region === 'global' ? GLOBAL_WITHHELD_IDS : undefined
+  const extra = fallbackModelsFor(region)
+    .filter(model => !named.has(model.id) && withheld?.has(model.id) !== true)
+  return extra.length === 0 ? live : [...live, ...extra]
 }

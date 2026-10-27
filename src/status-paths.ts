@@ -752,6 +752,17 @@ export interface PoolWebAccount {
   /** ISO timestamp when the dead mark expires and the account is retried; only while `credentialDead`. */
   credentialDeadUntil?: string
   /**
+   * The upstream RESTRICTED this account (business code 11140, "request illegal
+   * / 账号存在异常") — every call it makes is refused until the gateway relents.
+   *
+   * Kept apart from {@link credentialDead} on purpose: the sign-in is intact and
+   * a token refresh on such an account succeeds, so "Sign-in rejected / sign in
+   * again" is the one piece of advice that cannot help here.
+   */
+  restricted?: boolean
+  /** ISO timestamp when the restriction is re-tested; only while `restricted`. */
+  restrictedUntil?: string
+  /**
    * Per-model cooldowns currently active. The account is NOT `cooling` while a
    * model is limited — its other models still serve — but each entry tells the
    * card which model is out until when (e.g. `hy4-preview` cooling to 10:14,
