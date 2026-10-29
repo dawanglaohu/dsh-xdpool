@@ -37484,6 +37484,43 @@ async function generateRuntimeAuthFields(user) {
   });
   return JSON.parse(raw);
 }
+/**
+ * 从 WASM 的 `requestresult*` 结果里读回一个字符串字段。
+ *
+ * ⚠️ `invoke` 的参数顺序是 **(栈指针, 结果指针)** —— 与直觉相反，写反了
+ * 会读出空串而不是报错，表现为「请求发出去了但 URL 是空的」。
+ *
+ * `__wbindgen_add_to_stack_pointer` 必须成对：WASM 用这块 16 字节的
+ * 影子栈回传 (ptr, len) 两个 i32，不还原会让下一次调用读到脏栈。
+ */
+function readQoderResultString(g, result, invoke) {
+  const v = g.view();
+  const stack = g.exports.__wbindgen_add_to_stack_pointer(-16);
+  try {
+    invoke(stack, result);
+    const ptr = v.getInt32(stack + 0, true);
+    const len = v.getInt32(stack + 4, true);
+    return ptr ? g.readString(ptr, len) : "";
+  } finally {
+    g.exports.__wbindgen_add_to_stack_pointer(16);
+  }
+}
+/**
+ * 取 `requestresult_headers` 里的签名头。
+ *
+ * ⚠️ **必须原样透传**：其中 `Authorization` 是 WASM 生成的
+ * `Bearer COSY.<载荷>.<签名>`。用普通 `Bearer <token>` 覆盖会得到
+ * `403 Signature invalid`；漏掉 `Cosy-*` 系列头则被网关按未签名请求处理
+ * （模型目录端点直接 404，这也是「裸请求拿不到目录」的原因）。
+ */
+function qoderRequestHeaders(g, result) {
+  const headerMap = g.takeObject(g.exports.requestresult_headers(result));
+  const headers = {};
+  if (headerMap instanceof Map) {
+    for (const [key, value] of headerMap) headers[String(key)] = String(value);
+  }
+  return headers;
+}
 var QoderEncryptedInfer = class _QoderEncryptedInfer {
   constructor(g, context, metadata, host) {
     this.g = g;
@@ -37549,30 +37586,59 @@ var QoderEncryptedInfer = class _QoderEncryptedInfer {
         sourceLen
       );
     });
-    const headerMap = g.takeObject(g.exports.requestresult_headers(result));
-    const headers = {};
-    if (headerMap instanceof Map) {
-      for (const [k, v] of headerMap) headers[String(k)] = String(v);
-    }
-    const readResultString = (invoke) => {
-      let out = "";
-      const v = g.view();
-      const stack = g.exports.__wbindgen_add_to_stack_pointer(-16);
-      try {
-        invoke(stack, result);
-        const ptr = v.getInt32(stack + 0, true);
-        const len = v.getInt32(stack + 4, true);
-        out = ptr ? g.readString(ptr, len) : "";
-      } finally {
-        g.exports.__wbindgen_add_to_stack_pointer(16);
-      }
-      return out;
-    };
+    const headers = qoderRequestHeaders(g, result);
     return {
       // ⚠️ 参数顺序：(栈指针, ptr) —— 与直觉相反
-      url: readResultString((stack, ptr) => g.exports.requestresult_url(stack, ptr)),
+      url: readQoderResultString(g, result, (stack, ptr) => g.exports.requestresult_url(stack, ptr)),
       headers,
-      body: readResultString((stack, ptr) => g.exports.requestresult_body(stack, ptr))
+      body: readQoderResultString(g, result, (stack, ptr) => g.exports.requestresult_body(stack, ptr))
+    };
+  }
+  /**
+   * 构造一条**已签名**的普通 REST 请求（非推理）。返回 `{ url, headers }`。
+   *
+   * 模型目录端点 `GET {endpoint}{path}` 只认这种签名：实测裸 `Bearer <token>`
+   * 直连一律 404，带上 WASM 头才回 200。WASM 会在路径前自动补 `/algo`
+   * （`/api/v2/model/list` → `/algo/api/v2/model/list`），故调用方传的是
+   * 未加前缀的原路径。
+   *
+   * `business` 必须是 `'auth'`：`'infer'` 走的是推理签名域，网关会回 403。
+   */
+  request(options) {
+    const g = this.g;
+    const endpoint = options.endpoint;
+    const path = options.path;
+    const method = options.method ?? "GET";
+    const business = options.business ?? "auth";
+    const result = g.callPointer((stack) => {
+      const endpointPtr = g.writeString(endpoint);
+      const endpointLen = g.lastLength();
+      const pathPtr = g.writeString(path);
+      const pathLen = g.lastLength();
+      const methodPtr = g.writeString(method);
+      const methodLen = g.lastLength();
+      const businessPtr = g.writeString(business);
+      const businessLen = g.lastLength();
+      g.exports.qodercontext_prepareRequest(
+        stack,
+        this.context,
+        endpointPtr,
+        endpointLen,
+        pathPtr,
+        pathLen,
+        methodPtr,
+        methodLen,
+        businessPtr,
+        businessLen,
+        0,
+        0,
+        0,
+        0
+      );
+    });
+    return {
+      url: readQoderResultString(g, result, (stack, ptr) => g.exports.requestresult_url(stack, ptr)),
+      headers: qoderRequestHeaders(g, result)
     };
   }
 };
@@ -37688,60 +37754,64 @@ function unwrapQoderEnvelopeStream(response, label) {
 
 // vendor/channel-pack/src/qoder-product.ts
 var QODER_FALLBACK_MODELS = [
-  // ⚠️ 全部数值逐条对照本机 catalog-v6 实测（2026-09-21）。早期版本多处为
-  // 手工估值，与真实值**大范围不符**（14 个模型有偏差，如 `smodel` 写 3.2
-  // 实际 8、`qmodel_38max` 写 0.5 实际 0.2），用户据此报障。
-  // 改动本表时必须重新对照 catalog，不要凭印象填。
+  // ⚠️ 兜底表：**只在远端目录从未拉到时才会用到**。
   //
-  // 字段顺序：id, 展示名, 上下文, vl, reasoning, free, 倍率
+  // 适配器现在会向 `GET {catalogEndpoint.base}{catalogEndpoint.path}` 拉真实
+  // 目录（WASM 签名，普通 Bearer 直连 404，见 `fetchQoderRemoteCatalog`）；
+  // 拉到之后整张表被替换成服务端那一份。本表只剩两个用途：冷启动（用户
+  // 还没按过「重新获取模型」）与拉取失败时的兜底。
   //
-  // ⚠️ `contextWindow` 取官方档位表 `context_config` 的**最大档**，不是 `max_input_tokens`
-  // —— 与本文件 CN 表的同一口径，完整论证见那份表的注释与 AGENTS.md「2.1」。
-  // 国际版客户端里该判定的实现与 CN **逐字符同构**
-  // （`function LV(A,e){…let i=Jqr(A);if(i)return i.includes(t);…max_input_tokens…}`，
-  // 由 `scripts/probe-qoder-intl-window-logic.mjs` 复核），故同一条结论成立。
-  // 本表 17 条的档位表实测（`scripts/probe-qoder-windows.mjs intl`）：
-  // 除 `auto` 无档位表外**全部含 1M 档**（`performance` 是 {272K,400K,1M}、
-  // `efficient` 默认档为 400K）。
+  // 下面每一条都是 2026-10-27 从国际版真实目录逐字段抄下来的（`chat` 场景
+  // 14 条 + `qwake` 独有的 `performance`）。与上一版手工估值的差异集中在：
+  // `kmodel_latest` 已换成 Kimi-K3.1-Pro（倍率 1.0、非推理、默认档 high）、
+  // `mmodel` 已换成 MiniMax-M3.1-Flash（0.1）、`dfmodel` 现在免费（0）、
+  // `ultimate` 的倍率是 0.4 而不是 2（2 是错峰开始前的原价）、k/g/d 系
+  // 默认档从 `max` 纠正为 `high`；`qmodel_latest` / `qmodel`
+  // （Qwen3.7-Max / Plus）已从目录下线，本表随之删除。
   //
-  // ⚠️ **国际版的「服务端真能收多少」未实测**：`api2.qoder.sh` 在本机网络下
-  // 恒定 HTTP/2 `NGHTTP2_INTERNAL_ERROR`（连 1K 的最小请求也不通），
-  // 故本表依据是「客户端逻辑 + 目录档位表」，**不是** CN 那样的实发验证。
-  // 若将来国际版可用，应按 `probe-qoder-context-needle.mjs` 复核一遍。
+  // 字段口径（改动时必须保持）：
+  // - `contextWindow` 取官方档位表 `context_config` 的**最大档**，不是
+  //   `max_input_tokens`（`kmodel` 甚至不下发该字段，`efficient` 只有 200K 一档）。
+  // - `priceFactor` 是采集时刻的**生效价**；错峰折扣记在 `promotion` 里，
+  //   原价在 `promotion.beforePromotionPriceFactor`，展示名由
+  //   `qoderDisplayName` 按当前时间推算。
+  // - `defaultEffort` 必须取自该模型的 `efforts`，否则 DSH 抛
+  //   `UNSUPPORTED_REASONING_EFFORT`。
+  // - `supportsDisable` 仅当目录给了 `thinking_config.disabled` 分支时为真。
   //
-  // ⚠️ **思考档位**（`efforts` / `defaultEffort` / `supportsDisable`）逐条对照
-  // 客户端算法复刻结果（`scripts/probe-qoder-effort-fields.mjs`，按 `$lc` 顺序
-  // 逐字段试、再过白名单 `Qj`）。本表的档位来自目录 `thinking_config.enabled.efforts`。
-  { id: "auto", name: "Auto", contextWindow: 2e5, supportsImage: true, supportsThinking: false, priceFactor: 0.5 },
-  { id: "ultimate", name: "Ultimate", contextWindow: 1e6, supportsImage: true, supportsThinking: true, priceFactor: 2, efforts: ["xhigh", "high", "low", "max", "medium"], defaultEffort: "high", supportsDisable: true },
-  // ⚠️ `is_reasoning: false` 但 `thinking_config.enabled` 为真 —— 上游确实
-  // 提供档位选择，故 `efforts` 保留；而请求体的 `isReasoning` 取 `is_reasoning`。
-  // ⚠️ 档位表是 {272K(default), 400K, 1M}，取最大档。
+  // ⚠️ `performance` 在 `chat` 场景里**没有**，只在 `qwake` 场景下发
+  // （`qwake` 是 chat 14 条 + performance）。保留它是因为该账号确实有这个
+  // 模型；数值沿用上一版，未逐条实测。
+  { id: "auto", name: "Auto", contextWindow: 1e6, supportsImage: true, supportsThinking: false, priceFactor: 0.5 },
+  {
+    id: "ultimate",
+    name: "Ultimate",
+    contextWindow: 1e6,
+    supportsImage: true,
+    supportsThinking: true,
+    priceFactor: 0.4,
+    efforts: ["xhigh", "high", "low", "max", "medium"],
+    defaultEffort: "high",
+    promotion: { active: true, discountFactor: 0.2, beforePromotionPriceFactor: 2, windowStart: "22:00", windowEnd: "08:00", badgeZh: "\u9519\u5CF0 2 \u6298" }
+  },
   { id: "performance", name: "Performance", contextWindow: 1e6, supportsImage: true, supportsThinking: false, priceFactor: 1.1, efforts: ["xhigh", "high", "low", "max", "medium"], defaultEffort: "medium", supportsDisable: true },
-  // ⚠️ 档位表 {200K, 400K(default), 1M} —— 唯一默认档不是 200K 的国际版模型。
-  { id: "efficient", name: "Efficient", contextWindow: 1e6, supportsImage: true, supportsThinking: false, priceFactor: 0.3 },
-  // ⚠️ `smodel` / `cmodel` 有 5 档但**无 `disabled` 分支** → 不能关闭思考。
+  { id: "efficient", name: "Efficient", contextWindow: 2e5, supportsImage: true, supportsThinking: false, priceFactor: 0.3 },
   { id: "smodel", name: "Sonus", contextWindow: 1e6, supportsImage: true, supportsThinking: true, priceFactor: 8, efforts: ["xhigh", "high", "low", "max", "medium"], defaultEffort: "high" },
   { id: "cmodel", name: "Cantus", contextWindow: 1e6, supportsImage: true, supportsThinking: true, priceFactor: 4, efforts: ["xhigh", "high", "low", "max", "medium"], defaultEffort: "high" },
-  // 免费额度模型（is_free=true）：e2e 探针默认用它们以免消耗积分。
-  // ⚠️ `priceFactor` 是**采集时刻的生效价**（窗口内为折后价），原价在
-  // `promotion.beforePromotionPriceFactor`；展示时本地推算当前价。
   {
-    // ⚠️ 默认档与国际版其他模型不同：这里是 `xhigh`（CN 同模型是 `medium`）。
     id: "qmodel_38max",
     name: "Qwen3.8-Max",
     contextWindow: 1e6,
     supportsImage: true,
     supportsThinking: true,
-    isFree: true,
     priceFactor: 0.2,
     efforts: ["xhigh", "low", "medium"],
-    defaultEffort: "xhigh",
+    defaultEffort: "medium",
     supportsDisable: true,
     promotion: { active: true, discountFactor: 0.4, beforePromotionPriceFactor: 0.5, windowStart: "22:00", windowEnd: "08:00", badgeZh: "\u9519\u5CF0 4 \u6298" }
   },
   {
-    // ⚠️ `priceFactor: 0` 是**免费**（实测），不是缺失 —— 见接口注释。
+    // ⚠️ `priceFactor: 0` 是**免费**（实测 `is_free: true`），不是缺失 —— 见接口注释。
     id: "qfmodel",
     name: "Qwen3.8-Flash",
     contextWindow: 1e6,
@@ -37754,41 +37824,15 @@ var QODER_FALLBACK_MODELS = [
     defaultEffort: "medium",
     supportsDisable: true
   },
-  // ⚠️ 这两个模型目录里**只有 `disabled` + `enabled.is_default`，没有 `efforts`**
-  // —— 即官方只提供「关闭思考」一个选项（用户 2026-09-28 确认：
-  // 「上面两个没有思考档位就是关闭的意思」）。故 `efforts` 留空，
-  // 由 `supportsDisable` 表达，适配器会追加 `none`（复刻客户端 `gU()`）。
-  {
-    id: "qmodel_latest",
-    name: "Qwen3.7-Max",
-    contextWindow: 1e6,
-    supportsImage: true,
-    supportsThinking: false,
-    priceFactor: 0.1,
-    originalPriceFactor: 0.5,
-    supportsDisable: true,
-    promotion: { active: true, discountFactor: 0.2, beforePromotionPriceFactor: 0.5, windowStart: "22:00", windowEnd: "08:00", badgeZh: "\u9519\u5CF0 2 \u6298" }
-  },
-  {
-    id: "qmodel",
-    name: "Qwen3.7-Plus",
-    contextWindow: 1e6,
-    supportsImage: true,
-    supportsThinking: false,
-    priceFactor: 0.04,
-    supportsDisable: true,
-    promotion: { active: true, discountFactor: 0.4, beforePromotionPriceFactor: 0.1, windowStart: "22:00", windowEnd: "08:00", badgeZh: "\u9519\u5CF0 4 \u6298" }
-  },
-  { id: "kmodel_latest", name: "Kimi-K3", contextWindow: 1e6, supportsImage: true, supportsThinking: false, priceFactor: 1.4, efforts: ["high", "low", "max"], defaultEffort: "max" },
+  { id: "kmodel_latest", name: "Kimi-K3.1-Pro", contextWindow: 1e6, supportsImage: true, supportsThinking: false, priceFactor: 1, efforts: ["high", "low", "max"], defaultEffort: "high" },
   // ⚠️ 该模型**未下发 `max_input_tokens`**（这正是「该字段不是权威值」的旁证）——
-  // 旧表因此退回 `context_config` 的**默认档** 200K，但官方客户端给用户选的是
-  // **最大档** 1M（`zX()` 只查成员资格，不限于默认档）。故取 1M。
-  { id: "kmodel", name: "Kimi-K2.8-Preview", contextWindow: 1e6, supportsImage: true, supportsThinking: false, priceFactor: 0.8, efforts: ["high", "low", "max"], defaultEffort: "max" },
-  { id: "gmodel", name: "GLM-5.3", contextWindow: 1e6, supportsImage: true, supportsThinking: true, priceFactor: 0.8, efforts: ["high", "low", "max"], defaultEffort: "max" },
+  // 该字段缺失时退回 200K 会把用户挡在窗口外，官方客户端给的是最大档 1M。
+  { id: "kmodel", name: "Kimi-K2.8-Preview", contextWindow: 1e6, supportsImage: true, supportsThinking: false, priceFactor: 0.8, efforts: ["high", "low", "max"], defaultEffort: "high" },
+  { id: "gmodel", name: "GLM-5.3", contextWindow: 1e6, supportsImage: true, supportsThinking: true, priceFactor: 0.8, efforts: ["high", "low", "max"], defaultEffort: "high" },
   { id: "gfmodel", name: "GLM-5.3-Flash", contextWindow: 1e6, supportsImage: true, supportsThinking: true, priceFactor: 0.1, efforts: ["high", "max"], defaultEffort: "max" },
   { id: "dmodel", name: "DeepSeek-V4-Pro", contextWindow: 1e6, supportsImage: true, supportsThinking: true, priceFactor: 0.5, efforts: ["high", "max"], defaultEffort: "max", supportsDisable: true },
-  { id: "dfmodel", name: "DeepSeek-Flash", contextWindow: 1e6, supportsImage: true, supportsThinking: true, priceFactor: 0.1, efforts: ["high", "max", "low"], defaultEffort: "max", supportsDisable: true },
-  { id: "mmodel", name: "MiniMax-M3", contextWindow: 1e6, supportsImage: true, supportsThinking: false, priceFactor: 0.2 }
+  { id: "dfmodel", name: "DeepSeek-Flash", contextWindow: 1e6, supportsImage: true, supportsThinking: true, isFree: true, priceFactor: 0, originalPriceFactor: 0.1, efforts: ["high", "max", "low"], defaultEffort: "high", supportsDisable: true },
+  { id: "mmodel", name: "MiniMax-M3.1-Flash", contextWindow: 1e6, supportsImage: true, supportsThinking: false, priceFactor: 0.1 }
 ];
 var QODER = {
   id: "qoder",
@@ -37809,6 +37853,9 @@ var QODER = {
   sashClientType: "10",
   userAgentPrefix: "qoder",
   defaultCredentialRef: "QODER_ACCESS_TOKEN",
+  // 模型目录端点：`GET {base}{path}`，需要 WASM 签名（见 `QoderEncryptedInfer.request`）。
+  // 实测裸请求 404；签名后 200 / 59 KB，chat 场景 14 条。
+  catalogEndpoint: { base: "https://api1.qoder.sh", path: "/api/v2/model/list?Encode=1" },
   fallbackModels: QODER_FALLBACK_MODELS
 };
 var QODER_CN_FALLBACK_MODELS = [
@@ -38656,20 +38703,160 @@ function describeTransportCause4(error) {
   }
   return parts.join(" <- ");
 }
+/**
+ * 官方档位表 `context_config` 的最大档。
+ *
+ * ⚠️ 取**最大档**而不是 `max_input_tokens`：官方客户端只认档位表
+ * （`isContextWindowSupportedByModel` 一旦发现表存在就只检查「是否为表内成员」），
+ * 而 `max_input_tokens` 经常自相矛盾 —— `efficient` 两处都是 200K，
+ * 但 `kmodel` 干脆不下发该字段，照它填会把用户挡在窗口外。
+ * 两者都没有时返回 `void 0`（调用方据此不声明 context）。
+ */
+function qoderContextWindowOf(raw) {
+  let widest;
+  const config = raw?.context_config;
+  if (typeof config === "object" && config !== null) {
+    for (const tier of Object.values(config)) {
+      const tokens = tier?.token_count;
+      if (typeof tokens === "number" && Number.isFinite(tokens) && tokens > 0) {
+        widest = widest === void 0 ? tokens : Math.max(widest, tokens);
+      }
+    }
+  }
+  if (widest !== void 0) return widest;
+  const declared = raw?.max_input_tokens;
+  return typeof declared === "number" && Number.isFinite(declared) && declared > 0 ? declared : void 0;
+}
+/**
+ * 思考档位：键取自 `thinking_config.enabled.efforts`（保留目录原序）。
+ * 默认档取其中 `is_default: true` 的那一个；没有则 `void 0`（交由 DSH 用第一个）。
+ */
+function qoderEffortProfileOf(raw) {
+  const thinking = raw?.thinking_config;
+  const efforts = thinking?.enabled?.efforts;
+  if (typeof efforts !== "object" || efforts === null) return { efforts: void 0, defaultEffort: void 0, supportsDisable: thinking?.disabled !== void 0 };
+  const ids = Object.keys(efforts);
+  const defaultId = ids.find((id) => efforts[id]?.is_default === true);
+  return {
+    efforts: ids.length > 0 ? ids : void 0,
+    defaultEffort: defaultId,
+    // 「能否关闭思考」= 目录里存在 `disabled` 分支，不是猜的
+    supportsDisable: thinking?.disabled !== void 0
+  };
+}
+/**
+ * 错峰折扣：把服务端的 `promotion` 归一成本地形状。
+ *
+ * `price_factor` 是**采集时刻的生效价**，原价在 `before_promotion_price_factor`
+ * 里 —— 展示名由 `qoderDisplayName` 按当前时间在两者之间切换。
+ */
+function qoderPromotionOf(raw) {
+  const promotion = raw?.promotion;
+  if (typeof promotion !== "object" || promotion === null) return void 0;
+  const discount = promotion.discount_factor;
+  const before = promotion.before_promotion_price_factor;
+  if (typeof discount !== "number" || typeof before !== "number") return void 0;
+  return {
+    active: promotion.active !== false,
+    discountFactor: discount,
+    beforePromotionPriceFactor: before,
+    ...typeof promotion.window_start === "string" ? { windowStart: promotion.window_start } : {},
+    ...typeof promotion.window_end === "string" ? { windowEnd: promotion.window_end } : {},
+    ...typeof promotion.badge?.zh === "string" ? { badgeZh: promotion.badge.zh } : {}
+  };
+}
+/**
+ * 把服务端目录的一条 entry 映射成本地兜底表的同形状。
+ *
+ * 三种口径逐条对齐 `QODER_FALLBACK_MODELS` 的注释：`contextWindow` 取档位表
+ * 最大档、`priceFactor` 是生效价、`defaultEffort` 必须落在 `efforts` 内
+ * （否则 DSH 抛 `UNSUPPORTED_REASONING_EFFORT`）。
+ */
+function qoderModelFromRemote(raw) {
+  if (typeof raw?.key !== "string" || raw.key.length === 0) return void 0;
+  const profile = qoderEffortProfileOf(raw);
+  const promotion = qoderPromotionOf(raw);
+  const contextWindow = qoderContextWindowOf(raw);
+  const original = raw.original_price_factor;
+  return {
+    id: raw.key,
+    name: typeof raw.display_name === "string" && raw.display_name.length > 0 ? raw.display_name : raw.key,
+    ...contextWindow === void 0 ? {} : { contextWindow },
+    supportsImage: raw.is_vl === true,
+    supportsThinking: raw.is_reasoning === true,
+    ...raw.is_free === true ? { isFree: true } : {},
+    priceFactor: typeof raw.price_factor === "number" ? raw.price_factor : 0,
+    ...typeof original === "number" ? { originalPriceFactor: original } : {},
+    ...profile.efforts === void 0 ? {} : { efforts: profile.efforts },
+    // ⚠️ 默认档必须 ∈ efforts，否则 DSH 抛 UNSUPPORTED_REASONING_EFFORT
+    ...profile.defaultEffort === void 0 ? {} : { defaultEffort: profile.defaultEffort },
+    ...profile.supportsDisable ? { supportsDisable: true } : {},
+    ...promotion === void 0 ? {} : { promotion }
+  };
+}
+/** 目录文档 → 本地模型表。只用 `chat` 场景（`assistant` 与它同集）。 */
+function qoderCatalogFromRemote(document) {
+  const chat = document?.chat;
+  if (!Array.isArray(chat)) return [];
+  const models = [];
+  for (const raw of chat) {
+    if (raw?.enable === false) continue;
+    const model = qoderModelFromRemote(raw);
+    if (model !== void 0) models.push(model);
+  }
+  return models;
+}
+/**
+ * 向 Qoder 拉真实模型目录（WASM 签名 → GET → 解析）。
+ *
+ * 端点来自 `product.catalogEndpoint`；中国版没有实测过的端点，故直接跳过。
+ * 任何一步失败都抛错，由调用方决定保留旧目录 —— 目录拉不到**不能**让渠道不可用。
+ */
+async function fetchQoderRemoteCatalog(product, credential, fetchImpl) {
+  const endpoint = product.catalogEndpoint;
+  if (endpoint === void 0) {
+    throw new Error(`${product.id}: 该产品没有已知的模型目录端点`);
+  }
+  const client = await QoderEncryptedInfer.create({
+    user: { uid: credential.uid, securityOauthToken: credential.security_oauth_token ?? credential.access_token },
+    machineId: credential.machine_id,
+    metadata: { ...product.clientMetadata },
+    host: product.encryptedInferBase
+  });
+  const signed = client.request({ endpoint: endpoint.base, path: endpoint.path, method: "GET", business: "auth" });
+  const response = await fetchImpl(signed.url, { method: "GET", headers: signed.headers });
+  if (!response.ok) {
+    throw new Error(`${product.id}: 模型目录请求失败 HTTP ${response.status}`);
+  }
+  const document = await response.json();
+  const models = qoderCatalogFromRemote(document);
+  if (models.length === 0) {
+    throw new Error(`${product.id}: 模型目录为空（服务端可能调整了响应结构）`);
+  }
+  return models;
+}
 var QoderAdapter = class extends LlmAdapter4 {
   constructor(options) {
     super();
     this.options = options;
     this.product = options.product ?? QODER;
     this.fetchImpl = options.fetchImpl ?? fetch;
-    this.fallbackIndex = new Map(
-      (this.product.fallbackModels ?? []).map((model) => [model.id, model])
-    );
+    // ⚠️ 刷新必须改**实例字段**：`product` 是模块级共享对象（QODER / QODER_CN），
+    // 写 `this.product.fallbackModels` 会污染同产品的其它实例。
+    this.staticModels = options.product?.fallbackModels ?? QODER_FALLBACK_MODELS;
+    this.models = this.staticModels;
+    this.fallbackIndex = new Map(this.models.map((model) => [model.id, model]));
   }
   product;
   fetchImpl;
-  /** 产品级兜底模型索引（`product.fallbackModels` 的 id → 条目）。 */
+  /** 出厂兜底表（`product.fallbackModels`），刷新失败时回退到它。 */
+  staticModels;
+  /** 当前生效的模型目录：出厂兜底表，或最近一次远端拉取的结果。 */
+  models;
+  /** 模型索引（`models` 的 id → 条目），`stream`/`resolveModel` 逐次读它。 */
   fallbackIndex;
+  /** 远端目录拉取的并发去重 + 冷却（失败后 30s 内不再重试）。 */
+  catalogGate = new RemoteCatalogGate();
   /**
    * 可中止的休眠；信号中止时立即 resolve（不抛错，由调用方检查 signal）。
    *
@@ -38721,9 +38908,11 @@ var QoderAdapter = class extends LlmAdapter4 {
   /**
    * 模型目录。
    *
-   * **不发任何网络请求**：Qoder 的模型列表端点需要 WASM 签名
-   * （`qoder_auth_wasm`），本插件不实现，故恒用产品兜底表。
-   * 见设计文档 §2.6 与 `qoder-product.ts` 的 `fallbackModels` 说明。
+   * 读的是 **`this.models`**（实例字段）：出厂时等于产品兜底表，用户按过
+   * 「重新获取模型」之后被换成服务端权威目录。刷新只走显式入口
+   * （RPC `model.refresh`）—— 这四个目录方法都是**同步**的（`model.list`、
+   * `provider.status`、`catalogFactsFor` 都直接调 `listAllModels()`），
+   * 懒加载在同步签名下无法引入。
    */
   /**
    * 完整模型目录（**不应用用户黑名单**），含最终展示名（倍率/免费标记）。
@@ -38733,12 +38922,12 @@ var QoderAdapter = class extends LlmAdapter4 {
    * （用户报障：「关闭的就没有显示倍率」）。详见 `model.list` 端点的注释。
    */
   listAllModels() {
-    return this.product.fallbackModels.map((model) => ({ id: model.id, name: qoderDisplayName(model) }));
+    return this.models.map((model) => ({ id: model.id, name: qoderDisplayName(model) }));
   }
   async listModels(_provider) {
     if (!await providerCatalogVisible(this.options.accountPool, this.product.id)) return [];
     const disabled = this.options.accountPool?.disabledModelsFor(this.product.id);
-    const source = this.product.fallbackModels;
+    const source = this.models;
     const listed = disabled === void 0 || disabled.size === 0 ? source : source.filter((model) => !disabled.has(model.id));
     return listed.map((model) => ({
       provider: this.product.id,
@@ -38748,6 +38937,61 @@ var QoderAdapter = class extends LlmAdapter4 {
       name: qoderDisplayName(model),
       inputModalities: this.inputModalitiesFor(model.id)
     }));
+  }
+  /**
+   * 取一份可用于签名的凭据（目录拉取用；不绑定具体模型）。
+   *
+   * 与 `stream` 里的取法同形：先问账号池要可用的，取不到再 `refresh()` 一次，
+   * 仍然没有就抛 `MISSING_CREDENTIAL`（错误信息要让用户知道去重新登录）。
+   */
+  async catalogCredential() {
+    let credential = await this.options.resolveCredential("");
+    if (credential === void 0 || isQoderExpired(credential)) {
+      await this.options.refresh();
+      credential = await this.options.resolveCredential("");
+    }
+    if (credential === void 0 || credential.access_token.length === 0) {
+      throw new LlmError7(`${this.product.id}: no usable credential; log in first`, "MISSING_CREDENTIAL");
+    }
+    return this.ensureUid(credential);
+  }
+  /**
+   * 从服务端拉一次真实模型目录并换上。
+   *
+   * 返回换上的条目数。拉取失败时**保留现有目录**并把错误抛给调用方 ——
+   * 目录端点故障不该让整个渠道不可用；冷却由 `catalogGate` 兜住
+   * （失败后 30s 内不再重试，避免用户连点把网关打成 429）。
+   *
+   * `force` 用于「用户明确按了按钮」：先清掉冷却再拉。懒加载路径不传它，
+   * 于是同一轮内多次 `resolveModel` 只会真正拉一次。
+   */
+  async refreshRemoteCatalog({ force = false, signal } = {}) {
+    if (force) this.catalogGate.reset();
+    // ⚠️ `catalogGate.run` 会吞掉异常（失败即进入冷却），故自己接住再抛 ——
+    // 否则用户只能看到「拉取失败」，看不到到底是没凭据还是网关拒签。
+    let failure;
+    let fetched = -1;
+    await this.catalogGate.run(async () => {
+      if (signal?.aborted === true) return false;
+      try {
+        const credential = await this.catalogCredential();
+        const models = await fetchQoderRemoteCatalog(this.product, credential, this.fetchImpl);
+        this.models = models;
+        this.fallbackIndex = new Map(models.map((model) => [model.id, model]));
+        fetched = models.length;
+        return true;
+      } catch (error) {
+        failure = error;
+        return false;
+      }
+    });
+    if (failure !== void 0) throw failure;
+    if (fetched < 0) {
+      // 只可能是「已有一次拉取在飞」或「冷却期内」—— `force` 已清过冷却，
+      // 用户连点时会走到这里，报「进行中」比谎报失败准确。
+      throw new Error(`${this.product.id}: 模型目录正在拉取中，请稍后重试`);
+    }
+    return fetched;
   }
   /**
    * 解析模型元信息。
@@ -62847,6 +63091,39 @@ function registerChannelPackEndpoints(ctx, pool, codearts, buddy, workbuddy, lob
           }))
         };
         return { ok: true, value };
+      }
+      // ── 重新获取模型目录（本地扩展，dsh-xdpool 2026-10-27）──────────────
+      //
+      // 为什么需要显式端点而不是懒加载：目录方法（`listAllModels`）是**同步**
+      // 的，被 `model.list` / `provider.status` / `catalogFactsFor` 直接调用，
+      // 在同步签名里塞不进 `await`。所以「什么时候去拉」必须由用户按按钮决定。
+      //
+      // 只对 Qoder 家族开放：其余渠道的目录来自各自的远端接口或产品常量，
+      // 没有「重新拉一次」的语义，硬接会造出一个点了必报错的按钮。
+      case "model.refresh": {
+        const req = payload;
+        if (typeof req.provider !== "string" || req.provider.length === 0) {
+          return { ok: false, error: { code: "bad-request", message: "provider 必填" } };
+        }
+        if (!isQoderFamily(req.provider)) {
+          return { ok: false, error: { code: "bad-request", message: `该渠道不支持重新获取模型：${req.provider}` } };
+        }
+        const adapter = modelAdapters?.[req.provider];
+        if (adapter === void 0 || typeof adapter.refreshRemoteCatalog !== "function") {
+          return { ok: false, error: { code: "bad-request", message: `渠道适配器不可用：${req.provider}` } };
+        }
+        try {
+          // `force`：用户明确按了按钮，清掉失败冷却再拉一次
+          const count = await adapter.refreshRemoteCatalog({ force: true });
+          ctx.logger.info(`[channel-pack] 重新获取模型目录 ${req.provider}：${count} 个`);
+          // ⚠️ 必须广播：客户端把 `modelCatalog` 缓存在带 `status === 'ready'`
+          // 短路的 store 里，不广播就是「目录换了、界面还是旧的」。
+          broadcastCatalogChanged(ctx);
+          return { ok: true, value: { provider: req.provider, count } };
+        } catch (error) {
+          const reason = error instanceof Error ? error.message : String(error);
+          return { ok: false, error: { code: "bad-request", message: `重新获取模型失败：${reason}` } };
+        }
       }
       // 打开/关闭某个模型。写入后**不重建适配器**：适配器的 listModels 每次
       // 都直接读账号池的黑名单，因此下一次调用即返回新目录。

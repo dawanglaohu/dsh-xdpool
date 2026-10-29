@@ -347,8 +347,10 @@ export const CHANNEL_PACK_RPC_PATH = '/api/channel-pack'
  * - Login: `account.create` to begin, `login.poll` to watch it finish,
  *   `account.list` to show what is connected.
  * - Pool page, per channel: `provider.status` to learn which channels hold
- *   accounts, `model.list` for the catalogue, `model.setDisabled` for a single
- *   toggle, `model.setAllDisabled` for the two bulk buttons.
+ *   accounts, `model.list` for the catalogue, `model.refresh` to re-fetch a
+ *   channel's catalogue from its own server (only the Qoder channels implement
+ *   it), `model.setDisabled` for a single toggle, `model.setAllDisabled` for the
+ *   two bulk buttons.
  * - Per account: `account.test`, `account.refresh`, `account.update` to pause a
  *   sign-in, `account.delete` to remove it, and the two rate-limit actions —
  *   `account.retest` to re-probe the marked models and `account.reset` to delete
@@ -380,6 +382,7 @@ export const CHANNEL_PACK_METHODS: ReadonlySet<string> = new Set([
   'credits.status',
   'login.poll',
   'model.list',
+  'model.refresh',
   'model.setAllDisabled',
   'model.setContextBudget',
   'model.setDisabled',

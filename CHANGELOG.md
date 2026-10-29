@@ -1,6 +1,37 @@
 # Changelog
 本项目的所有重要变更都会记录在此文件。
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
+## 2.4.9 — Qoder 的模型目录以前只能靠手写兜底表，现在能真的去拉一次
+> 现象是「Qoder 的模型列表是旧的，也没地方让它重新拉」。原因不在 UI：`QoderAdapter` 的 `listAllModels` / `listModels` / `resolveModel` / `stream` 全部直接读模块级常量 `product.fallbackModels`（`vendor/channel-pack/pack.js`），而插件的模型目录端点需要 WASM 签名，上游索性把这条路关了 —— 于是目录永远是那份手抄的 17 条，国际版已经换了两代（Kimi-K3 → Kimi-K3.1-Pro、MiniMax-M3 → MiniMax-M3.1-Flash），插件还在报旧名字。
+>
+> 两件事一起做：**入口**（真去拉一次远端目录）和**订正**（兜底表按实测重写）。
+
+### 远端目录：把签名请求做进适配器
+`vendor/channel-pack/pack.js` 里原本只有 `qodercontext_prepareInferRequest` 的绑定，没有 `prepareRequest`。新增 `QoderEncryptedInfer.request({ endpoint, path, method, business })` 补上这条绑定（`business` 必须是 `'auth'`，`'infer'` 会被网关回 403；WASM 自己给路径加 `/algo` 前缀），并把 `prepareInfer` 里内联的 `headerMap` / `readResultString` 抽成两个模块级助手（`readQoderResultString` / `qoderRequestHeaders`）供两边共用 —— 这两个函数的参数顺序是 (栈指针, 结果指针)，写反只会读出空串，所以抽出来单独测。
+
+端点是 `GET https://api1.qoder.sh/api/v2/model/list?Encode=1`，实测 200 / 59,784 字节，顶层 `chat` 14 条。它写在 `QODER.catalogEndpoint` 上而不是硬编码在函数里：中国版没有可用端点（`gateway.qoder.com.cn` 回 503、`api1.qoder.com.cn` 解析不了），`QODER_CN` 就没有这个字段，`fetchQoderRemoteCatalog` 见到缺失会直说「该产品没有已知的模型目录端点」。
+
+映射由五个纯函数承担（`qoderContextWindowOf` / `qoderEffortProfileOf` / `qoderPromotionOf` / `qoderModelFromRemote` / `qoderCatalogFromRemote`）：`context_config` 取**最宽档**的 `token_count` 而不是 `max_input_tokens`（前者才是 DSH 真正吃进去的窗口），`thinking_config.enabled.efforts` 的键做档位、`is_default: true` 的那个做默认值、有没有 `disabled` 分支决定能不能关思考，`promotion` 归一成卡片认识的 `{active, discountFactor, beforePromotionPriceFactor, windowStart, windowEnd, badgeZh}`（`badge.zh` 就是「错峰 4 折」那句话）。
+
+### 刷新要写实例，不能写产品
+`QODER` / `QODER_CN` 是模块级共享对象，往 `product.fallbackModels` 写会连累同一产品的另一个适配器实例。`QoderAdapter` 因此有了 `staticModels`（初始常量）和 `models`（当前目录）两个字段，五个读目录的方法改读 `this.models`，刷新时 `this.models` 与 `this.fallbackIndex` 一起换 —— 只换前者的话 `stream` 还在用旧名字和旧窗口发请求。
+
+`refreshRemoteCatalog({ force })` 复用 `stream` 那条取凭据的路（池里挑账号 → 过期就刷 → `ensureUid`），并挂 `RemoteCatalogGate` 去重：它会在失败后冷却 30 秒，**并且把异常吞成 `false`**，所以这里自己接住 `failure` 再抛，否则用户按了按钮只会看到「什么都没发生」。`force` 先 `gate.reset()`，这是「显式刷新」与「懒加载」的区别。
+
+### 一个 RPC、一个按钮
+`vendor/channel-pack/pack.js` 新增 `case "model.refresh"`（校验 provider 属 Qoder 家族 → 取 `modelAdapters[provider]` → `refreshRemoteCatalog({ force: true })` → `broadcastCatalogChanged`），返回 `{ provider, count }`。适配器外面裹着两层 Proxy（`withDeadModelPruning` / `withContextBudgets`），它们对未知方法走 `Reflect.get` + bind，新方法自动透传，不用改包装。
+
+`src/status-paths.ts` 的 `CHANNEL_PACK_METHODS` 加 `'model.refresh'`（19 项），`src/client/ChannelPoolSection.tsx` 在「刷新余额」旁边给 `qoder` / `qodercn` 多渲染一个「重新获取模型」（`REMOTE_CATALOG_CHANNELS`，别的渠道按下必然报不支持，所以不渲染），成功后用 `channelpool.refreshModelsDone` 报条目数。
+
+### 兜底表按 2026-10-27 的实测重写
+兜底表仍是冷启动和拉取失败时的目录，但它现在是**实测值**而非传闻：`auto` 的窗口 2e5 → 1e6（档位表里有 1M 档）、`efficient` 1e6 → 2e5（只有 200K 一档）、`ultimate` 倍率 2 → 0.4 并补上「错峰 2 折」的 promotion、`qmodel_38max` 默认档 xhigh → medium、`kmodel_latest` 改名 Kimi-K3.1-Pro 且倍率 1.4 → 1、`kmodel`/`gmodel` 默认档 max → high、`dfmodel` 倍率 0.1 → 0 且标免费、`mmodel` 改名 MiniMax-M3.1-Flash 且倍率 0.2 → 0.1；远端已经没有的 `qmodel_latest`（Qwen3.7-Max）和 `qmodel`（Qwen3.7-Plus）删掉。`performance` 保留但注明：它只在 `qwake` 场景下发，`chat` 里没有。
+
+**中国版的表没动**：本机 `.qoder/.models` 下只有国际版账号的 catalog 副本，CN 一份实测数据都没有，按传闻改一张已经有实测记录的表不如不改。
+
+### 回归
+`tests/qoder-remote-catalog.test.ts`（9 条）：从 bundle 里切出六个纯函数用 `new Function` 执行，断言窗口取最宽档（1M / 只有 200K 时 2e5 / 缺 `max_input_tokens` 仍按档位 / 全缺则 undefined）、档位与默认档、`defaultEffort` 越界时省略（DSH 会抛 `UNSUPPORTED_REASONING_EFFORT`）、promotion 归一、整条映射（免费模型 `priceFactor: 0` 且 `isFree`）、只读 `chat` 并跳过 `enable: false`；另三条断言 adapter 读 `this.models` 而**不再**读 `this.product.fallbackModels`、刷新同时替换 `models` 与 `fallbackIndex`、bundle 里确实有 `case "model.refresh"`。
+
+基线 84 files / 1,076 tests → 85 files / 1,085 tests 全通过；`npx tsc -p tsconfig.json --noEmit` 干净。`vendor/channel-pack/NOTICE.md` 的「OFM 本地适配」节登记了这次对 `pack.js` 的直改。
 ## 2.4.8 — 两份手改文件被 Windows 加了 BOM，插件把其中一份读成了「什么都没配」
 > 2.4.7 修完 11140 之后，用户重启，国际版报错消失了，但两件事露了出来。一是**账号锁定在重启后没有生效**：`C:\Users\admin\.dsh\.xdpool\preferred.json` 是 47 字节，头三个是 `EF BB BF`，后 44 个是一份完全正确的 `{"version":1,"accountId":"73349e22201eddc4"}` —— `JSON.parse` 拒绝这个前缀，四个读者各自把异常吞成自己的空值，于是「已锁定哪一路账号」这个设置静默失效，卡片上 `preferredAccountId` 是 undefined。二是**模型连接测试直接崩**：`POST /plugins/dsh-xdpool/model/test` 返回 `{"ok":false,"outputChars":0,"error":"content.some is not a function"}`。
 

@@ -47,6 +47,7 @@ import {
   fetchChannels,
   modelsFrom,
   providerStatusesFrom,
+  refreshCountFrom,
   resetResultFrom,
   retestResultFrom,
   type ChannelResetOutcome,
@@ -102,6 +103,15 @@ const MODEL_SEARCH_THRESHOLD = 8
 const CONTEXT_BUDGET_DEFAULT = 200_000
 
 const REGION_OWNED_CHANNELS: ReadonlySet<string> = new Set(['buddy', 'workbuddy'])
+/**
+ * Channels whose catalogue lives on the vendor's own server and can be pulled
+ * again on demand.
+ *
+ * Only the Qoder family implements `model.refresh`; every other channel either
+ * ships its catalogue inside the pack or fetches it behind a login flow, so a
+ * refresh button there would answer `unsupported` on every press.
+ */
+const REMOTE_CATALOG_CHANNELS: ReadonlySet<string> = new Set(['qoder', 'qodercn'])
 
 interface ChannelEntry {
   channel: PoolWebChannel
@@ -552,6 +562,37 @@ export function ChannelPoolSection({ t }: { readonly t?: Translate | undefined }
     }
   }
 
+  /**
+   * Ask the vendor for its current catalogue and replace the card's rows.
+   *
+   * The catalogue is the vendor's, not ours: models ship, get renamed and lose
+   * their free window ("Qwen3.7-Max" became "Kimi-K3.1-Pro" at a different
+   * multiplier), and the card has no way to learn that on its own — the model
+   * list is synchronous on the pack side, so nothing refreshes it lazily. This
+   * button is that path.
+   *
+   * `load()` afterwards rather than patching `models` in place: the server also
+   * re-derives disabled/dead/context facts for the new rows, and the card would
+   * otherwise show a fresh model list against stale per-model facts.
+   */
+  const refreshModels = async (provider: string): Promise<void> => {
+    markBusy(provider, true)
+    try {
+      const envelope = await callPack('model.refresh', { provider })
+      if (!mountedRef.current) return
+      const count = refreshCountFrom(envelope)
+      if (count === undefined) {
+        setNotice(envelope.error?.message
+          ?? t?.('channelpool.refreshModelsFailed') ?? 'Could not fetch the model list.')
+        return
+      }
+      setNotice(t?.('channelpool.refreshModelsDone', { count }) ?? `Model list updated (${count} models).`)
+      await load()
+    } finally {
+      if (mountedRef.current) markBusy(provider, false)
+    }
+  }
+
   const claim = async (provider: string): Promise<void> => {
     markBusy(provider, true)
     try {
@@ -749,10 +790,26 @@ export function ChannelPoolSection({ t }: { readonly t?: Translate | undefined }
                     {t?.('channelpool.refreshBalance') ?? 'Refresh balances'}
                   </button>
                 )}
+                {/* Only the channels that own their catalogue remotely get this
+                    button. Everywhere else the pack answers `unsupported`, and
+                    a button that only ever errors reads as broken. It sits next
+                    to "refresh balances" because both mean "the server knows
+                    something newer than this card does". */}
+                {REMOTE_CATALOG_CHANNELS.has(channel.id) && (
+                  <button
+                    type="button"
+                    className="dsm-xdpool-btn"
+                    data-tone="quiet"
+                    disabled={isBusy}
+                    onClick={() => { void refreshModels(channel.id) }}
+                  >
+                    {t?.('channelpool.refreshModels') ?? 'Refresh models'}
+                  </button>
+                )}
                 {/* The two lists are this card's real navigation, so they are
-                    pushed to the far edge: reading order runs credit → refresh →
-                    accounts → models, and the model list is what most readers
-                    came for in the first place. */}
+                    pushed to the far edge: reading order runs credit → the two
+                    refresh buttons → the fold toggles, and the model list is what
+                    most readers came for in the first place. */}
                 <span className="dsm-xdpool-cpool-acts-gap" />
                 <button
                   type="button"

@@ -45,6 +45,13 @@ rm -rf vendor/channel-pack/node_modules
 
 - `src/index.ts`：增加可选 `disableOpencode` 挂载配置；OFM 开启它时跳过重复 OpenCode adapter、默认匿名账号和能力表预热，保留历史账号及凭据。省略时维持上游行为。
 - `src/channel-pack-rpc.ts`：追加同一配置，关闭时拒绝 `opencode.*` 与通用 `account.create(provider=opencode)`。
+- `pack.js`：Qoder 家族改为**可刷新目录**（2026-10-27 直接改产物，未走 `src/` 再构建）。
+  新增 `QoderEncryptedInfer.request()`（`qodercontext_prepareRequest` 的签名绑定，`business: 'auth'`）、
+  `qoderCatalogFromRemote` 及其四个字段映射纯函数、`QoderAdapter.refreshRemoteCatalog()`
+  与 RPC `model.refresh`；`QoderAdapter` 的 `models` / `staticModels` 由产品常量改为实例字段
+  （写 `product.fallbackModels` 会污染共享的 `QODER` / `QODER_CN`）。同时按 2026-10-27 的
+  国际版真实目录订正 `QODER_FALLBACK_MODELS`（Kimi-K3.1-Pro / MiniMax-M3.1-Flash / dfmodel 免费 /
+  ultimate 倍率 0.4 等）。中国版兜底表未动：本机没有 CN 目录副本，无实测依据。
 - 打包入口改为 `src/index.ts`；宿主模块仍保持外部，jose/undici 内联。
 - 构建依赖固定为 esbuild 0.24.2、jose 6.2.9、undici 8.11.2；本次重构建核对了原包的依赖代码，未借此升级运行依赖。
 

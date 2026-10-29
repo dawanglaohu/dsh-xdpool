@@ -86,6 +86,7 @@ describe('channel route contract', () => {
       'credits.status',
       'login.poll',
       'model.list',
+      'model.refresh',
       'model.setAllDisabled',
       'model.setContextBudget',
       'model.setDisabled',

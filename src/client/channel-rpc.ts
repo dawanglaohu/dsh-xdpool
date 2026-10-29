@@ -743,6 +743,22 @@ export function claimResultFrom(envelope: ChannelRpcEnvelope): ChannelClaimResul
   }
 }
 
+/**
+ * How many models a `model.refresh` run pulled, or `undefined` when the pack
+ * refused or answered without a count.
+ *
+ * A refusal is kept as a refusal, like every other reader here: "the vendor's
+ * catalogue endpoint answered with 14 models" and "the button did nothing"
+ * are different sentences, and the card prints them differently.
+ */
+export function refreshCountFrom(envelope: ChannelRpcEnvelope): number | undefined {
+  if (!envelope.ok) return undefined
+  const value = envelope.value
+  if (value === null || typeof value !== 'object') return undefined
+  const count = (value as { count?: unknown }).count
+  return typeof count === 'number' && Number.isSafeInteger(count) && count > 0 ? count : undefined
+}
+
 /** One model the pack's retest could not clear, and what the vendor said. */
 export interface ChannelRetestStillLimited {
   readonly modelId: string
