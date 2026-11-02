@@ -16,10 +16,17 @@
  *   5. do the inject names resolve, or are some dead weight?
  *
  * Usage: node scripts/check-adoption.mjs [--profile <dir>] [--dsh-root <dir>] [--json]
+ *
+ * Since 0.2.1-rc.5 the desktop host ships inside app.asar, so no
+ * resources/app/dsh directory exists to point --dsh-root at. When the default
+ * root is gone the script re-executes itself under the bundled Electron
+ * runtime-as-node (the same one dsh.cmd uses), because only that runtime can
+ * open paths inside the archive.
  */
 
 import { readFileSync, existsSync } from 'node:fs'
 import { createHash } from 'node:crypto'
+import { spawnSync } from 'node:child_process'
 import { join, dirname, resolve } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 
@@ -33,7 +40,23 @@ function flag(name, fallback) {
   return value
 }
 
-const dshRoot = resolve(flag('dsh-root', process.env.DSH_HARNESS_ROOT ?? 'D:\\Program Files\\DeepSeek Harness\\resources\\app\\dsh'))
+const DEFAULT_DSH_ROOT = 'D:\\Program Files\\DeepSeek Harness\\resources\\app\\dsh'
+const DEFAULT_ASAR_ROOT = 'D:\\Program Files\\DeepSeek Harness\\resources\\app.asar\\dsh'
+const rootOverride = flag('dsh-root', process.env.DSH_HARNESS_ROOT ?? '')
+const asarDefault = rootOverride === '' && !existsSync(DEFAULT_DSH_ROOT) && existsSync('D:\\Program Files\\DeepSeek Harness\\resources\\app.asar')
+if (asarDefault && process.env.XDPOOL_ADOPTION_ASAR !== '1') {
+  // Re-exec under the Electron runtime-as-node: plain node cannot read inside app.asar.
+  const electron = 'D:\\Program Files\\DeepSeek Harness\\DeepSeek Harness.exe'
+  if (!existsSync(electron)) throw new Error('resources/app/dsh is gone and the desktop exe was not found at ' + electron)
+  const rerun = spawnSync(electron, ['--expose-internals', fileURLToPath(import.meta.url)], {
+    env: { ...process.env, ELECTRON_RUN_AS_NODE: '1', XDPOOL_ADOPTION_ASAR: '1' },
+    encoding: 'utf8',
+  })
+  process.stdout.write(rerun.stdout ?? '')
+  process.stderr.write(rerun.stderr ?? '')
+  process.exit(rerun.status ?? 2)
+}
+const dshRoot = resolve(rootOverride !== '' ? rootOverride : asarDefault ? DEFAULT_ASAR_ROOT : DEFAULT_DSH_ROOT)
 const profileDir = resolve(flag('profile', process.env.DSH_PROFILE_DIR ?? join(process.env.DSH_HOME ?? '', 'profiles', 'desktop')))
 const asJson = process.argv.includes('--json')
 

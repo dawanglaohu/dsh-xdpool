@@ -1,6 +1,124 @@
 # Changelog
 本项目的所有重要变更都会记录在此文件。
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
+## 2.4.10 — 400 落在哪个码上就报哪个原因：11128 有三个触发器，11133 是另一回事
+> 现象是「用国内版账号聊天，回 `workbuddy upstream client (http 400) after 1 account(s) [🍀眠#…]: {"code":11128,"msg":"Illegal API invocation from an unapproved channel"}`」，之后在另一条会话里变成 `{"code":11133,"msg":"Invalid request parameters"}`。2.3.0 把 11128 归因成「缺三个会话标识头」，理由是当时的 `displayTips` 说「这次调用没通过渠道校验，可能不是官方客户端发出的」。**那条提示是误导**。
+>
+> 对着活网关逐项做过 bisect：去掉三个会话头、换 UA、换 `X-IDE-Version`、去掉 `X-Product`、换模型名、加 2 MB body —— 全部 200。唯一能把 200 变回 400/11128 的，是 `messages` 里出现 `role: "developer"`（放在首条、末尾、夹在中间都一样）。
+
+### 第二个触发器：网关会认文本，不只是认协议
+`developer` 改完之后仍有会话被 11128 拒，抓下来的真实 body（`kimi-k3.1-pro`，49 779 字符 system + 277 个 tools，585 KB）原样重放能稳定复现，说明它不是协议形状问题。二分到最后只剩 **111 个字符**：
+
+```
+Tokens prefixed with @ are paths the user explicitly referenced. Relative paths resolve from the workspace root
+```
+
+这段一起被拒绝，换个词、换个词序、把 `@` 换成 `#`、整串反转就都是 200；十个随机 120 字符 prompt、`'x'.repeat(80_000)` 也都是 200 —— 所以它既不是长度限制也不是随机抽样，是**对着别家 agent 客户端的系统提示词做指纹匹配**。同一批测试里 `You are Claude Code, Anthropic's official CLI for Claude.` 也被拒，`You are Cursor, an AI code editor.` 却是 200，指向同一个结论：网关在拦「不是官方客户端发的」这件事，但判据是提示词文本而不是请求头。
+
+问题在于那句话**不是用户写的**：`@deepseek-ai/dsh-file-reference` 把它当作文件引用说明，任何会话只要提到过路径就会带上它。于是每个普通会话都可能被拒，而报文永远说「渠道校验失败」，与真正的原因无关。
+
+修法：`src/upstream.ts` 新增 `GATEWAY_BLOCKED_PHRASES`，`prepareChatBody` 在发出前把命中的句子换成同义措辞（`Tokens starting with @ name paths the user explicitly referenced. Relative paths resolve against the working directory`），字符串和 content block 数组两条路径都覆盖。四个账号对旧句子全 400、对新措辞全 200；改后完整 585 KB body 连打两次都是 200。
+
+**改写只作用于 `system` 轮。** 逐项测过这一句放在别处的后果：作为 `user` 消息 → 200，作为 `tool` 结果 → 200，写在某个工具的描述里 → 200，只有 `system` 轮被拒。所以工具定义和工具输出一个字节都不动 —— 会话去 grep DSH 源码时看到的仍是原文，改写也不会在文件内容回传给模型的路上动手。`tests/chat-identity-headers.test.ts` 里有一条用例专门钉住这点（`tools` 全等、user 轮与 tool 结果逐字不变）。
+
+这条名单只能靠实测追加 —— 网关换个指纹就得再补一条，所以两个入口（`neutraliseSignatures` / `neutraliseMessageContent`）留在同一个常量旁边，注释里写清了它是怎么被测出来的。
+
+### 第三个触发器：宿主自己的产品名也在指纹名单里
+
+换措辞之后仍有会话被 11128 拒（`hy4-preview` + 54 tools + 17 412 字符 system，requestId `8cb9abe7…`）。同一套 bisect 走一遍：`no tools` → 400、`users only` → 200、占位 system → 200，还是 system 文本的问题。前缀二分定位到第一处是固定的一句 **`You are an AI agent powered by DeepSeek Harness.`** —— 逐词从任一端删一个就 200，前面加 `Intro. ` 或换行也 200，只加空格仍 400，所以它被锚定在文本开头。
+
+但去掉这一句、以及把它换成 `You are a coding agent.` 之后**仍 400**，说明不止一处。全量窗口扫描（900 字符窗、450 步长，39 个窗）命中 `@0`、`@15750`、`@16200`，二分求出的第二处是 `[16410, 16631)` 这段 221 字符：
+
+```
+You are interacting with the user through the DeepSeek Harness Web GUI whose URL the runtime
+context names. When the user refers to "this page", "this GUI", or "this app" without naming
+another target, they mean this GUI.
+```
+
+这段的匹配是**松散的**：拆成两半各自 200，拼起来 400；前半加后半的前 12 个词 → 200；从任一端缩短到一定长度就 200。也就是说它要的是一段连续文本，不是一个精确字符串。
+
+决定性的一发是替换产品名：把 17 412 字符里**三处** `DeepSeek Harness` 全部换成 `DSH`，整段 prompt 连测三次全 200（换 `the host environment` / `the harness` 也 200）；换成 `Deep Seek Harness`（中间插一个空格）**仍然 400**，换成 `DeepSeek-Harness` 又是 200 ⇒ 匹配忽略大小写与内部空白。归一化之后再跑一遍 39 个窗口的扫描，命中数为 **0**。
+
+所以 `src/upstream.ts` 新增 `BLOCKED_PRODUCT_NAMES = [/Deep\s*Seek\s*Harness/gi]`，在 `neutraliseSignatures` 里先过产品名、再过短句名单，替换成 `DSH` —— 模型仍然读得出这是同一个东西。作用域和上一个触发器一致：**只有 `system` 轮被匹配**，这句放进 `user` 轮或某个工具的 `description` 里都是 200（那份 dump 的 `user[2]` 里就有这个产品名，照样不触发），所以工具定义与工具输出依旧一个字节不动。
+
+真网关端到端：dump 里那份 73 626 字节的 body 原样重放 → **400/11128**；过 `prepareChatBody` → 73 587 字节、system 里三处命中归零 → **200**。`tests/chat-identity-headers.test.ts` 新增两条：产品名在 system 轮被改（含大小写与内部空白的变体）、在 user 轮和 tool 描述里逐字保留。
+
+### `developer` 从哪来：pi-ai 的 compat 探测对 loopback 判错了
+pi-ai 的 chat/completions 编码器用 `model.reasoning && compat.supportsDeveloperRole` 决定指令轮的角色。`supportsDeveloperRole` 由它自己的 `detectCompat` 猜：只要 baseUrl 既不是 OpenRouter、也不在那份 non-standard 名单（nvidia / cerebras / xai / together / chutes / deepseek / zai / moonshot / opencode / cloudflare / ant-ling）里，就判 `true`。插件的 baseUrl 是 `http://127.0.0.1:<port>/v1` —— 两边都不匹配，于是**每一个 reasoning 模型都以 `role: "developer"` 发出去**，网关一律 11128。
+
+修在源头：`src/adapter.ts` 新增 `SHIM_COMPAT = { supportsDeveloperRole: false }`，`toPiModel` / `toAggregateModel` / `toComboModel` 的 `compat` 都带上它。`toExtraLaneModel` **故意不带** —— 那条车道的 body 交给它自己的第三方上游（`https://opencode.ai`），WorkBuddy 拒的角色根本到不了那里，硬改成 `system` 等于替别人改写它本来接受的形状。
+
+`prepareChatBody` 里的 `developer → system` 保留，作为兜底（旧版 pi-ai、第三方调用方直接打 shim 的情况）。
+
+### 顺手修掉的第二个 400：`kimi-k3.1-pro` 的 11151
+网关要求 `messages[0].role === 'system'`，所以 `prepareChatBody` 在调用方没给 system 时会合成一条。原来合成的是 `content: ''`，而 `kimi-k3.1-pro` 对空 system 回 400 + 11151 `a message has empty content`（同一 body 里只要有任意非空文本就 200）。合成轮改用 `PLACEHOLDER_SYSTEM = '(no system prompt)'`。
+
+### 2.3.0 的结论已作废，注释也一起改了
+`src/upstream.ts` 里那段「三个会话头是 11128 闸门 / 去掉任一个就复发」的长注释整段重写：三个头保留（桌面端会发、便宜，网关哪天又读它们也不至于缺），但明确写上「不要再把任何一个说成必需的」。真正的两个触发器只有 `developer` 角色和首条非 system。
+
+### 第三个 400：`11133` —— 模型不吃这个思考档
+
+上面两个修完之后，同一条会话的另一轮换成了 `{"code":11133,"msg":"Invalid request parameters","extError":{"code":"400001","message":"the request parameters were rejected by the model provider"}}`。11133 和 11128 是两件事：11128 是网关的渠道判断，11133 是**模型提供方**拒参数。
+
+抓了真实会话（`kimi-k3.1-pro` + 277 tools + 49 779 字符 system + `reasoning_effort: "max"`）原样重放 20 多次，只出现过 14003（模型饱和），一直没复现 11133 —— 说明 kimi 那一发是模型侧临时拒绝。但同一套机制在**另一个模型上是稳定复现的**：
+
+| 用例 | 结果 |
+| --- | --- |
+| `hy4-preview` + `reasoning_effort: "max"` | **400/11133**（连打 3 次全中） |
+| `hy4-preview` + `reasoning_effort: "high"` | 200 |
+| `kimi-k3.1-pro` / `deepseek-v4.1-flash` / `glm-5.3` + `max` 或 `high` | 全部 200 |
+
+原因是活目录里 `hy4-preview` 的 `reasoning` 只声明了 `{"supportedEfforts":["high"]}`，而 `agent-default-model` 给的是 `reasoningEffort: max` —— 这个设置是整个 picker 共享的，选到只认 `high` 的行就必然被拒。`kimi-k3.1-pro` 声明 `["low","high","max"]`，所以它那次 11133 是模型侧的临时拒绝，不是配置错。
+
+修法两层：
+
+1. `src/upstream.ts` 新增 `clampReasoningEffort(requested, supportedEfforts)`：把请求的档位挪到该行声明里最接近的一档（`max` → `high`），不在 `EFFORT_LADDER` 上的词（含 `none`）原样放行，不认识的值绝不猜。`prepareChatBody` 新增可选的第二参数 `supportedEfforts`，`buildChatBody` 一并透传；`src/shim.ts` 的主路径、combo 成员、压缩摘要、上下文恢复四处都从 `effectiveRowOf(catalog, modelId)?.supportedEfforts` 读声明。
+2. 兜底：声明可能过期，也可能根本没拉到。`isEffortRejection(body)` 认 `11133` / `11150`，命中时 `withoutReasoningEffort(prepared)` 把 `reasoning_effort` 整条摘掉重试一次（每请求一次，因为档位来自会话而非账号，换账号会同样失败）。实测同一 body 去掉 effort 字段，`hy4-preview` 就是 200。
+
+`none` 不进夹紧表：它是「不思考」，已经测遍全部 18 个在售模型都能 200，把它映射成某个具体档位等于替用户改语义。`tests/upstream-error-classification.test.ts` 钉住 11133/11150 的识别与「无关 400 不许误判」，`tests/chat-identity-headers.test.ts` 钉住夹紧规则（降级、取最近邻、未知档位与空声明不动、`none` 不动）。
+
+### 夹紧救不了的两处：内置目录没有档位、provider 会临时翻脸
+
+上面两层上线后用户仍复现，抓了他的会话流才发现两个缺口。
+
+**缺口一：内置目录的 18 行一个档位都没写。** 夹紧是「拿请求和目录声明求交」，声明缺失就无从夹起 —— `effectiveRowOf` 返回 `undefined`，`max` 原样上网关，`hy4-preview` 立刻 11133。而唯一带 `supportedEfforts` 的内置行当时只有 `step-5-preview`。更糟的是内置目录里**根本没有 `kimi-k3.1-pro`**（只有旧 id `kimi-k3-1`），用户默认模型正好是它。启动时那一次活目录拉取失败，整套夹紧就自动失效，而界面看不出任何异常。
+
+修法：把活目录实测到的 `supportedEfforts` 补进 `FALLBACK_WORKBUDDY_MODELS`（`hy4-preview` / `hy4-preview-x` → `['high']`；`hy3-x` → `['low','high']`；`deepseek-v4.1-flash` / `glm-5.3` / `glm-5.3-flash` / `kimi-k2.8-preview` / `kimi-k3.1-pro` → `['low','high','max']`；`space-bunny` / `minimax-m3.1-flash` → `['low','medium','high','xhigh','max']`），并补上缺失的 `kimi-k3.1-pro` 行。活目录报 `null` 的行**依旧留空** —— 给它们编一个声明，等于把网关本来会接受的值夹掉。
+
+**缺口二：`kimi-k3.1-pro` 那次 11133 是 provider 侧临时拒绝。** 用 `real3.json` 里那 610 KB 的原样 body 重放 20 次全是 200，把 `max_completion_tokens` / `max_tokens` 从 32000 扫到 200000、复用同一个 `X-Conversation-ID`、同会话中途换模型，也都 200 —— 稳定复现 11133 的只有「目录拿不到声明」这一条。但网关把这类 400 归给「the model provider」，而同一个 provider 几十毫秒后就对同样字节回 200。
+
+修法：摘掉档位后仍被拒，就再用同一份 body 试一次（每请求一次，等 500 ms）。`skip` 只在 `effortDropped` 之后生效 —— 普通畸形 body 不会重发，否则每个 400 都要多花一次往返。`tests/shim-effort-retry.test.ts` 钉住这两层：夹紧生效、首次拒后摘档位、摘档位后仍拒再试一次、无关 400 不重试。
+
+### 拒绝时把那份 body 留下来
+
+上面两层都花完之后仍被拒的请求，光看日志是查不动的：`requestShape` 只打印键名和计数，而这轮实测里真正的原因两次都藏在字节里（`developer` 角色、`tool-removal` 内容块）。更麻烦的是，从会话流重建 body 再重放，两次都得到 200 —— 说明重建和 shim 实际发出的那份并不是同一份，这时继续猜 body 是浪费。
+
+所以 `src/rejected-body.ts` 新增 `recordRejectedBody`：把**这次被拒的完整 body** 连同 model / account / status / 上游原话写进 `$DSH_HOME/.xdpool/last-rejected-body.json`。一个文件，每次覆盖，超过 4 MiB 就不写（一个池目录是状态，不是日志池，不能因为 N 次拒绝就堆 N 兆）。写盘失败被静默吞掉 —— 这段代码跑在已经在报 400 的路径上，一个文件系统错误不该把真正的错误顶掉。
+
+顺带实测确认了一条新的 400 成因：`role: "system"`（或 `developer`）轮的 `content` 若含网关不认识的块类型，回的是 **11101 `Parse message failed: unsupported content type at index N: <type>`**（`tool-removal`、`thinking` 都会）。`pi-ai` 1.3.0 会把这类块整条丢掉，所以只有绕过 pi-ai 直接打 shim 的调用方才会撞上。`tests/rejected-body.test.ts` 钉住 dump 的位置、只留一份、以及不可解析的 body 也按文本保留。
+
+### 第三个 11133 触发器：工具 schema 里 `oneOf` 不写 `type`
+留下的那份 dump 终于把 11133 稳定复现出来了 —— 在此之前二十多次「从会话流重建 body 再重放」全是 200，因为重建的和 shim 实际发出的不是同一份。有了原件逐项 bisect：删掉 `max_completion_tokens`（原值 131072）、换成 `max_tokens`、把输出上限从 32000 扫到 200000、改 `store`、去掉 `stream_options` —— 全 400；**`tools` 一去掉就 200**。
+
+对着单 tool 逐关键词测，网关认的是一份白名单：`oneOf` / `anyOf` 节点**不带同级 `type`** → 400；`enum` 不带 `type` → 400；`$ref` 解析不到（悬空）→ 400；`$ref` 解析后命中上面任一形状 → 400；纯 object 链嵌套 **≥30 层** → 400（28 层是 200）。补上 `type` 就是 200。反过来，`const`、`allOf`、`not`、`dependentRequired`、`minProperties`、`$schema`、`examples` 单独发出去**全是 200** —— 所以修法不能一刀切删关键词，那会把模型需要的校验信息一起扔掉。
+
+现实中的来源是 MCP server。本机的 REA 一套里 `mcp__rea__compare_web_captures`、`compare_process_captures`、`capture_browser_scenario`、`capture_native_ui_scenario`、`inspect_analysis_view` 五个都带这类 schema（`completeness` 是 4 个变体的 `oneOf`、`steps` 里的 `anyOf` 也没有 `type`）。它们单独就能把整轮打死：`capture_browser_scenario` 只有 14 KB、`capture_native_ui_scenario` 只有 3 KB —— 和体积无关（把良性 tool padding 到 150 KB 仍然 200），只和形状有关。所以症状是「换一台机器/换一套 MCP 就时好时坏」，而报文说的是「模型提供方拒绝了参数」。
+
+修法：新增 `src/tool-schema.ts`，`sanitiseToolSchemas` 在 `prepareChatBody` 里跑，对 `tools[].function.parameters` 做两件事 —— 先把 `$ref` 按 `$defs` 内联（深度上限 10，循环安全），再删掉 `$defs/$ref/oneOf/anyOf`，并在 union 的每个变体都声明同一个 `type` 时把该 `type` 提到父节点（`enum` 同理，从字面量推断）。内联优先于直接删，是因为只删 `$ref` 会让一个参数退化成 `{ description }`，模型得靠猜来填参数结构。单个 schema 内联后超过 120 KB 时降级成「只留顶层参数名 + 描述」，宁可让那个工具少一点参数细节，也不让整轮请求失败。
+
+不同模型的业务码不一样：同一份 body `glm-5.3` 给 200、`deepseek-v4.1-flash` 给 11129、`hy4-preview` 和 `kimi-k3.1-pro` 给 11133。所以判断依据不能用码，只能用 schema 形状。
+
+回归：`tests/tool-schema.test.ts`（9 条）钉住 union 删除与 type 推断、`$ref` 内联后仍保留 `description`、悬空 `$ref` 降级、enum 补 type、网关接受的关键词逐字保留、无 tools/畸形 entries 返回 `false`、循环 `$ref` 不死循环、超大 schema 降级。真网关验证：dump 里那份 542 KB body 原样 400/11133，过 `prepareChatBody`（452 KB）后 200；同一份 prepared body 换 `deepseek-v4.1-flash`、`hy4-preview`、`glm-5.3` 也全部 200。
+
+### 测试不再写坏那份 dump
+`recordRejectedBody` 只在真正遇到拒绝时写盘，而单元测试正好会造出拒绝 —— 一跑测试就把用户正在查的那份 `last-rejected-body.json` 覆盖掉（本轮就发生过一次：文件从 542 KB 变成 500 字节的测试夹具）。`XDPOOL_NO_BODY_DUMP=1` 可关闭写入，`vitest.config.ts` 的 `test.env` 默认打开它，需要真写的 `tests/rejected-body.test.ts` 在 `beforeEach` 里自己去删除这个变量。
+
+## rc.5 适配 — 插件声明面对齐 harness 0.2.1-rc.5（纯版本滚动，无 API 变化）
+> npm 上 `@deepseek-ai/dsh` 的 `next` tag 已指到 0.2.1-rc.5，桌面 nightly feed 也放出了 rc.5 安装包（2026-10-29）。对着 rc.5 tarball 逐文件 SHA256 比对：插件消费的全部 11 个 devDep 包（dsh-attachment / dsh-client-locale / dsh-client-ui-primitives / dsh-client-ui-settings-plugins / dsh-client-ui-slots / dsh-credentials / dsh-host-webserver / dsh-launch-environment / dsh-llm / dsh-llm-pi-ai / dsh-settings）的 lib 产物与 rc.3 **字节级一致**，差异只有 package.json 版本串。rc.4/rc.5 期间 ``@deepseek-ai/cordis``（4.0.5）、``@deepseek-ai/schemastery``（3.18.5）、``@earendil-works/pi-ai``（1.4.0）、``@deepseek-ai/dsh-client-runtime``（0.1.1-rc.2）四个外部线未动，无需跟升。
+> 兼容闸门（`evaluatePluginCompatibility`）实测 rc.3 / rc.4 / rc.5 全部 ACCEPTED，`engines.dsh` 仍是 `>=0.1.5-rc.1 <0.3.0`，不需要 `compatibility.json` 豁免。
+> 验证：rc.5 devDeps 下 vitest 88 files / 1115 tests 全过；`tsc` host 0 errors；`tsc -p tsconfig.client.json` 7 errors 为既有债务（accounts/context-budget/free-upstream/proxy-fetch，与 rc.5 无关）；`tsdown` 构建通过；`pnpm check:adoption` 对磁盘 rc.3 宿主全项 PASS（inject-names-resolve WARN 为预期——ui-slots / ui-primitives 是 renderer 打包产物，不在宿主 graph）。
+> 注意：本机磁盘仍是 rc.3（桌面版还没真正升上去），`check:adoption` 的 `apply-ran` 判据读的是 rc.3 宿主下的启动日志。桌面升级到 rc.5 后重跑一次即可。
+
 ## 2.4.9 — Qoder 的模型目录以前只能靠手写兜底表，现在能真的去拉一次
 > 现象是「Qoder 的模型列表是旧的，也没地方让它重新拉」。原因不在 UI：`QoderAdapter` 的 `listAllModels` / `listModels` / `resolveModel` / `stream` 全部直接读模块级常量 `product.fallbackModels`（`vendor/channel-pack/pack.js`），而插件的模型目录端点需要 WASM 签名，上游索性把这条路关了 —— 于是目录永远是那份手抄的 17 条，国际版已经换了两代（Kimi-K3 → Kimi-K3.1-Pro、MiniMax-M3 → MiniMax-M3.1-Flash），插件还在报旧名字。
 >

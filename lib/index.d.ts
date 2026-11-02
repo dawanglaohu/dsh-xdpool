@@ -582,7 +582,7 @@ export declare class WorkBuddyUpstreamClient {
    * An effort the caller DID send is left untouched — this only fills the gap,
    * which is what keeps a user's explicit thinking level meaningful.
    */
-  prepareChatBody(raw: string): string;
+  prepareChatBody(raw: string, supportedEfforts?: readonly string[]): string;
   /**
    * Parse a raw OpenAI chat body without normalising it.
    *
@@ -591,7 +591,7 @@ export declare class WorkBuddyUpstreamClient {
    */
   parseChatBody(raw: string): Record<string, unknown> | undefined;
   /** Re-serialise `base` with a rewritten `messages` array, still normalised. */
-  buildChatBody(base: Record<string, unknown>, messages: readonly ChatMessage[]): string;
+  buildChatBody(base: Record<string, unknown>, messages: readonly ChatMessage[], supportedEfforts?: readonly string[]): string;
   /**
    * Run one NON-streaming completion and return the assistant text.
    *
@@ -2401,6 +2401,16 @@ interface WorkBuddyModelInfo {
  * says 192K, and listed `kimi-k3` under an id the gateway no longer uses
  * (`kimi-k3-1`). A stale fallback is worse than a short one — it looks
  * authoritative while being wrong.
+ *
+ * `supportedEfforts` is carried here for the same reason, and it is the one
+ * field whose absence changes behaviour rather than just display. The gateway
+ * rejects a `reasoning_effort` the row does not declare (business code 11133 /
+ * 11150), and the clamp in `prepareChatBody` can only intersect the request with
+ * a declaration it has. A row with no `supportedEfforts` therefore gets no clamp
+ * at all, so the level the session asks for goes out unmodified and a
+ * `max`-defaulted session fails on every row that only admits `high`. Rows the
+ * live endpoint reports without `supportedEfforts` stay absent here on purpose:
+ * inventing one would clamp requests the gateway would have accepted.
  *
  * `multiplier: 0` is the gateways' own spelling of "free" (`credits: "x0.00"`),
  * which is what turns on the free badge.

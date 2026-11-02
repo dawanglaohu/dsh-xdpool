@@ -162,12 +162,16 @@ describe('prepareChatBody guarantees the gateway contract', () => {
     expect((parse(raw)['messages'] as Record<string, unknown>[])[0]['content']).toBe('sys')
   })
 
-  it('synthesises an empty system message when the caller sent none', () => {
-    // The gateway only checks the role of messages[0], so an empty system turn
-    // is enough — and inventing prompt text would change what the model sees.
+  it('synthesises a placeholder system message when the caller sent none', () => {
+    // The gateway checks the role of messages[0], but not every row tolerates an
+    // empty one: `kimi-k3.1-pro` answers `content: ''` with 400 + 11151
+    // ("a message has empty content") while the same body answers 200 once that
+    // turn holds any non-empty text. The placeholder satisfies both checks and
+    // says nothing a model would act on.
     const raw = JSON.stringify({ model: 'm', messages: [{ role: 'user', content: 'hi' }] })
     expect(roles(raw)).toEqual(['system', 'user'])
-    expect((parse(raw)['messages'] as Record<string, unknown>[])[0]['content']).toBe('')
+    const content = (parse(raw)['messages'] as Record<string, unknown>[])[0]['content']
+    expect(content).toBe('(no system prompt)')
   })
 
   it('treats a relabelled developer turn as the system message it became', () => {
@@ -175,6 +179,114 @@ describe('prepareChatBody guarantees the gateway contract', () => {
     // in place, a developer-first request would still trip 11128.
     const raw = JSON.stringify({ model: 'm', messages: [{ role: 'developer', content: 'sys' }] })
     expect(roles(raw)).toEqual(['system'])
+  })
+
+  it('rewrites the phrase the gateway reads as a rival harness', () => {
+    // The gateway matches request text against other harnesses' prompts and
+    // answers a hit with 400 + 11128 — the same code a missing system turn earns.
+    // `@deepseek-ai/dsh-file-reference` ships the sentence below verbatim, so an
+    // otherwise well-formed session was refused. Rewording keeps the instruction
+    // and drops the fingerprint; every account answered 200 to the new wording and
+    // 400 to the old one.
+    const sentence = 'Tokens prefixed with @ are paths the user explicitly referenced.'
+      + ' Relative paths resolve from the workspace root; absolute paths identify files.'
+    const raw = JSON.stringify({ model: 'm', messages: [{ role: 'system', content: sentence }] })
+    const content = (parse(raw)['messages'] as Record<string, unknown>[])[0]['content'] as string
+    expect(content).toBe('Tokens starting with @ name paths the user explicitly referenced.'
+      + ' Relative paths resolve against the working directory; absolute paths identify files.')
+    expect(content).not.toContain('resolve from the workspace root')
+  })
+
+  it('rewrites the phrase inside a content block array too', () => {
+    const raw = JSON.stringify({
+      model: 'm',
+      messages: [{
+        role: 'system',
+        content: [
+          { type: 'text', text: 'prefix' },
+          {
+            type: 'text',
+            text: 'Tokens prefixed with @ are paths the user explicitly referenced.'
+              + ' Relative paths resolve from the workspace root',
+          },
+        ],
+      }],
+    })
+    const blocks = (parse(raw)['messages'] as Record<string, unknown>[])[0]['content'] as Record<string, unknown>[]
+    expect(blocks[0]['text']).toBe('prefix')
+    expect(blocks[1]['text']).toBe('Tokens starting with @ name paths the user explicitly referenced.'
+      + ' Relative paths resolve against the working directory')
+  })
+
+  it('rewrites the host product name the gateway also matches', () => {
+    // Not a sentence but a brand, and matched loosely: a refused 17 412-character
+    // system prompt held three occurrences of the name, all inside offending
+    // spans; replacing every one made the whole prompt answer 200, while
+    // `Deep Seek Harness` (one space inserted) still triggered and
+    // `DeepSeek-Harness` did not. So case and internal whitespace are ignored.
+    const raw = JSON.stringify({
+      model: 'm',
+      messages: [{
+        role: 'system',
+        content: 'You are an AI agent powered by Deep Seek HARNESS.\n'
+          + 'You are interacting with the user through the DeepSeek Harness Web GUI.',
+      }],
+    })
+    const content = (parse(raw)['messages'] as Record<string, unknown>[])[0]['content'] as string
+    expect(content).toBe('You are an AI agent powered by DSH.\n'
+      + 'You are interacting with the user through the DSH Web GUI.')
+  })
+
+  it('leaves the host product name alone outside the system turn', () => {
+    // The match is on the system turn only — the name in a user message or a tool
+    // description is accepted, and rewriting it would alter text the caller reads
+    // back. The dump that produced this fix carried the name in user[2] too.
+    const tools = [{
+      type: 'function',
+      function: { name: 'read_file', description: 'powered by DeepSeek Harness', parameters: { type: 'object', properties: {} } },
+    }]
+    const raw = JSON.stringify({
+      model: 'm',
+      tools,
+      messages: [
+        { role: 'system', content: 'sys' },
+        { role: 'user', content: 'powered by DeepSeek Harness' },
+      ],
+    })
+    const body = parse(raw)
+    expect(tools[0].function.description).toBe('powered by DeepSeek Harness')
+    expect((body['messages'] as Record<string, unknown>[])[1]['content']).toBe('powered by DeepSeek Harness')
+  })
+
+  it('leaves user turns, tool results and tool descriptions byte-identical', () => {
+    // Only `system` turns are matched — the same sentence as a user message, as a
+    // tool result, or inside a tool description is accepted. Rewriting beyond the
+    // system turn would edit tool output the caller is about to read, so the
+    // rewrite stays where the check is.
+    const sentence = 'Tokens prefixed with @ are paths the user explicitly referenced.'
+      + ' Relative paths resolve from the workspace root'
+    const tools = [{
+      type: 'function',
+      function: { name: 'read_file', description: sentence, parameters: { type: 'object', properties: {} } },
+    }]
+    const raw = JSON.stringify({
+      model: 'm',
+      tools,
+      messages: [
+        { role: 'system', content: 'sys' },
+        { role: 'user', content: sentence },
+        {
+          role: 'assistant',
+          content: '',
+          tool_calls: [{ id: 'c1', type: 'function', function: { name: 'read_file', arguments: '{}' } }],
+        },
+        { role: 'tool', tool_call_id: 'c1', content: sentence },
+      ],
+    })
+    const out = parse(raw)
+    expect(out['tools']).toEqual(tools)
+    expect((out['messages'] as Record<string, unknown>[])[1]['content']).toBe(sentence)
+    expect((out['messages'] as Record<string, unknown>[])[3]['content']).toBe(sentence)
   })
 
   it('leaves an already-conforming body alone', () => {
@@ -203,5 +315,50 @@ describe('prepareChatBody guarantees the gateway contract', () => {
     // lets a user ask for thinking would do nothing.
     expect(parse(JSON.stringify({ model: 'hy3', messages: [], reasoning_effort: 'high' }))['reasoning_effort'])
       .toBe('high')
+  })
+
+  describe('thinking level clamping', () => {
+    /** The row's own declaration, as the catalog reports it. */
+    const clamp = (effort: string | undefined, supportedEfforts: readonly string[]): unknown => {
+      const body: Record<string, unknown> = { model: 'm', messages: [] }
+      if (effort !== undefined) body['reasoning_effort'] = effort
+      return (JSON.parse(client.prepareChatBody(JSON.stringify(body), supportedEfforts)) as Record<string, unknown>)['reasoning_effort']
+    }
+
+    it('downgrades a level the row does not declare', () => {
+      // `hy4-preview` declares `["high"]` only. The session-level default is
+      // `max`, so selecting that row asked for a level it has never supported and
+      // the gateway answered 400 + 11133 ("the request parameters were rejected by
+      // the model provider") on every attempt — measured on the live gateway,
+      // while the same body asking for `high` answered 200.
+      expect(clamp('max', ['high'])).toBe('high')
+      expect(clamp('max', ['low', 'high', 'max'])).toBe('max')
+    })
+
+    it('picks the nearest declared neighbour rather than the first entry', () => {
+      expect(clamp('max', ['low', 'high'])).toBe('high')
+      expect(clamp('low', ['high', 'max'])).toBe('high')
+      expect(clamp('medium', ['minimal', 'max'])).toBe('minimal')
+      expect(clamp('xhigh', ['low', 'medium', 'high'])).toBe('high')
+    })
+
+    it('leaves an unknown level and a row with no declaration alone', () => {
+      // `none` and any vocabulary this table does not know may still be valid
+      // upstream; guessing a replacement would silently change the request.
+      expect(clamp('none', ['high'])).toBe('none')
+      expect(clamp('turbo', ['high'])).toBe('turbo')
+      expect(clamp('max', [])).toBe('max')
+      expect(JSON.parse(client.prepareChatBody(
+        JSON.stringify({ model: 'm', messages: [], reasoning_effort: 'max' }),
+      ))['reasoning_effort']).toBe('max')
+    })
+
+    it('leaves the synthesised default at none, which every row accepts', () => {
+      // `none` is not on the ladder, so it is never rewritten: it was measured
+      // against every advertised row and all of them answered 200, including the
+      // ones that declare a single level. Clamping it would trade a working
+      // request for a guess about how a row reads "off".
+      expect(clamp(undefined, ['high', 'max'])).toBe('none')
+    })
   })
 })

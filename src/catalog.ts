@@ -44,25 +44,36 @@ export interface WorkBuddyModelInfo {
  * (`kimi-k3-1`). A stale fallback is worse than a short one — it looks
  * authoritative while being wrong.
  *
+ * `supportedEfforts` is carried here for the same reason, and it is the one
+ * field whose absence changes behaviour rather than just display. The gateway
+ * rejects a `reasoning_effort` the row does not declare (business code 11133 /
+ * 11150), and the clamp in `prepareChatBody` can only intersect the request with
+ * a declaration it has. A row with no `supportedEfforts` therefore gets no clamp
+ * at all, so the level the session asks for goes out unmodified and a
+ * `max`-defaulted session fails on every row that only admits `high`. Rows the
+ * live endpoint reports without `supportedEfforts` stay absent here on purpose:
+ * inventing one would clamp requests the gateway would have accepted.
+ *
  * `multiplier: 0` is the gateways' own spelling of "free" (`credits: "x0.00"`),
  * which is what turns on the free badge.
  */
 export const FALLBACK_WORKBUDDY_MODELS: readonly WorkBuddyModelInfo[] = [
   { id: 'auto', name: 'Auto', contextWindow: 256_000, maxOutputTokens: 32_000, supportsImages: true, tags: ['craft'] },
-  { id: 'hy4-preview', name: 'Hy4 preview', contextWindow: 960_000, maxOutputTokens: 64_000, supportsImages: true, multiplier: 0.29, tags: ['craft', 'badge:夜间免费:#FF0000'] },
+  { id: 'hy4-preview', name: 'Hy4 preview', contextWindow: 960_000, maxOutputTokens: 64_000, supportsImages: true, multiplier: 0.29, supportedEfforts: ['high'], tags: ['craft', 'badge:夜间免费:#FF0000'] },
   { id: 'hy3', name: 'Hy3', contextWindow: 192_000, maxOutputTokens: 64_000, supportsImages: true, multiplier: 0, tags: ['craft', 'badge:限时免费:#FF0000'] },
-  { id: 'hy3-x', name: 'Hy3', contextWindow: 192_000, maxOutputTokens: 64_000, supportsImages: true, multiplier: 0.05 },
-  { id: 'space-bunny', name: 'Space-Bunny', contextWindow: 1_000_000, maxOutputTokens: 64_000, supportsImages: true, multiplier: 0.08 },
-  { id: 'deepseek-v4.1-flash', name: 'Deepseek-V4.1-Flash', contextWindow: 1_000_000, maxOutputTokens: 128_000, supportsImages: true, multiplier: 0.11 },
+  { id: 'hy3-x', name: 'Hy3', contextWindow: 192_000, maxOutputTokens: 64_000, supportsImages: true, multiplier: 0.05, supportedEfforts: ['low', 'high'] },
+  { id: 'space-bunny', name: 'Space-Bunny', contextWindow: 1_000_000, maxOutputTokens: 64_000, supportsImages: true, multiplier: 0.08, supportedEfforts: ['low', 'medium', 'high', 'xhigh', 'max'] },
+  { id: 'deepseek-v4.1-flash', name: 'Deepseek-V4.1-Flash', contextWindow: 1_000_000, maxOutputTokens: 128_000, supportsImages: true, multiplier: 0.11, supportedEfforts: ['low', 'high', 'max'] },
   { id: 'deepseek-v4-pro', name: 'Deepseek-V4-Pro', contextWindow: 1_000_000, maxOutputTokens: 128_000, supportsImages: true, multiplier: 0.51 },
   { id: 'deepseek-v4-flash', name: 'DeepSeek-V4-Flash', contextWindow: 1_000_000, maxOutputTokens: 128_000, supportsImages: true },
-  { id: 'glm-5.3', name: 'GLM-5.3', contextWindow: 1_000_000, maxOutputTokens: 64_000, supportsImages: true, multiplier: 0.79 },
-  { id: 'glm-5.3-flash', name: 'GLM-5.3-Flash', contextWindow: 1_000_000, maxOutputTokens: 131_072, supportsImages: true, multiplier: 0.06 },
+  { id: 'glm-5.3', name: 'GLM-5.3', contextWindow: 1_000_000, maxOutputTokens: 64_000, supportsImages: true, multiplier: 0.79, supportedEfforts: ['low', 'high', 'max'] },
+  { id: 'glm-5.3-flash', name: 'GLM-5.3-Flash', contextWindow: 1_000_000, maxOutputTokens: 131_072, supportsImages: true, multiplier: 0.06, supportedEfforts: ['low', 'high', 'max'] },
   { id: 'glm-5.2', name: 'GLM-5.2', contextWindow: 1_000_000, maxOutputTokens: 64_000, supportsImages: true, multiplier: 0.79, tags: ['craft', 'badge:夜间折扣:#1E90FF'] },
   { id: 'glm-5.1', name: 'GLM-5.1', contextWindow: 200_000, maxOutputTokens: 48_000, supportsImages: false, multiplier: 0.79 },
   { id: 'glm-5v-turbo', name: 'GLM-5v-Turbo', contextWindow: 200_000, maxOutputTokens: 64_000, supportsImages: true, multiplier: 0.71 },
   { id: 'kimi-k3-1', name: 'Kimi-K3', contextWindow: 1_000_000, maxOutputTokens: 32_000, supportsImages: true, multiplier: 1.62 },
-  { id: 'kimi-k2.8-preview', name: 'Kimi-K2.8-Preview', contextWindow: 1_000_000, maxOutputTokens: 64_000, supportsImages: true, multiplier: 0.77 },
+  { id: 'kimi-k3.1-pro', name: 'Kimi-K3.1-Pro', contextWindow: 1_000_000, maxOutputTokens: 32_000, supportsImages: true, supportedEfforts: ['low', 'high', 'max'] },
+  { id: 'kimi-k2.8-preview', name: 'Kimi-K2.8-Preview', contextWindow: 1_000_000, maxOutputTokens: 64_000, supportsImages: true, multiplier: 0.77, supportedEfforts: ['low', 'high', 'max'] },
   { id: 'kimi-k2.7', name: 'Kimi-K2.7-Code', contextWindow: 256_000, maxOutputTokens: 32_000, supportsImages: true, multiplier: 0.57 },
   { id: 'kimi-k2.6', name: 'Kimi-K2.6', contextWindow: 256_000, maxOutputTokens: 32_000, supportsImages: true, multiplier: 0.52 },
   { id: 'minimax-m3', name: 'MiniMax-M3', contextWindow: 512_000, maxOutputTokens: 64_000, supportsImages: true, multiplier: 0.25 },

@@ -18,10 +18,11 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import { Readable, Transform } from 'node:stream'
 import type { WorkBuddyAccount, WorkBuddyAccountPool, WorkBuddyCredential } from './accounts.ts'
 import type { WorkBuddyCatalog, WorkBuddyModelInfo } from './catalog.ts'
-import { parseRateLimitReset, WorkBuddyUpstreamClient, type ChatStreamResult, type UpstreamErrorKind, type WorkBuddyRegion } from './upstream.ts'
+import { isEffortRejection, parseRateLimitReset, withoutReasoningEffort, WorkBuddyUpstreamClient, type ChatStreamResult, type UpstreamErrorKind, type WorkBuddyRegion } from './upstream.ts'
 import { compactWithSummary, estimateMessagesTokens, hardTruncate, repairToolPairing, type ChatMessage } from './context-budget.ts'
 import { AggregateError, forwardAggregateStreamed, resolveAggregateProvider, type AggregateCatalog } from './aggregate.ts'
 import { parseProviderModelId } from './providers.ts'
+import { recordRejectedBody } from './rejected-body.ts'
 import {
   COMBO_CHANNEL,
   comboChain,
@@ -813,7 +814,10 @@ function withBareModelId(raw: string, modelId: string): string {
           }
           continue
         }
-        const prepared = client.prepareChatBody(raw)
+        const prepared = client.prepareChatBody(
+          raw,
+          effectiveRowOf(catalog, member.modelId)?.supportedEfforts,
+        )
         const result = await client.chatStream(
           account.credential,
           prepared,
@@ -1000,7 +1004,10 @@ function withBareModelId(raw: string, modelId: string): string {
       )
       return
     }
-    const prepared = client.prepareChatBody(raw)
+    let prepared = client.prepareChatBody(
+      raw,
+      effectiveRowOf(catalog, modelId)?.supportedEfforts,
+    )
     // `sticky` binds each conversation to one account; the pool ignores this
     // under every other distribution.
     const conversationKey = conversationKeyOf(raw)
@@ -1010,6 +1017,15 @@ function withBareModelId(raw: string, modelId: string): string {
     // never the whole one.
     const tried: string[] = []
     let last: { kind: UpstreamErrorKind; status: number; message: string } | undefined
+    // One dropped-level retry per request, not per account: the level comes from
+    // the session, not the account, so a second account would fail identically.
+    let effortDropped = false
+    // And one more attempt at the level-free body. The gateway blames "the model
+    // provider", which is a downstream that answers 200 to the same bytes a
+    // moment later — measured, a body refused twice in a row was accepted on the
+    // next attempt. Without this, a transient provider hiccup reaches the user as
+    // "Invalid request parameters", which reads as their fault.
+    let effortRetried = false
     // One identity per user request, minted once, so every account the pool
     // rotates through - and the compaction retry below - file under the SAME
     // turn. Counting those separately would overstate how much the user asked
@@ -1108,7 +1124,10 @@ function withBareModelId(raw: string, modelId: string): string {
         )
         return
       }
-      tried.push(account.label)
+      // The dropped-level retry comes back to the SAME account (the level is a
+      // session property, not an account one), so a repeat label must not read as
+      // a second account in the terminal message.
+      if (tried[tried.length - 1] !== account.label) tried.push(account.label)
       const result = await chatStreamWithSaturationRetry(
         client,
         account.credential,
@@ -1204,9 +1223,62 @@ function withBareModelId(raw: string, modelId: string): string {
       // never message content) so the next occurrence is diagnosable from the
       // log instead of requiring a reproduction.
       if (result.kind === 'client') {
+        // A row that refuses the thinking level answers 11133/11150 even after
+        // the level was clamped onto its own declaration — a live catalog can be
+        // stale, and an undeclared row gets no clamp at all. Asking for no level
+        // is accepted by every row measured, so retry once that way before
+        // reporting a 400 the caller cannot act on.
+        if (!effortDropped && isEffortRejection(result.message)) {
+          const stripped = withoutReasoningEffort(prepared)
+          if (stripped !== undefined) {
+            prepared = stripped
+            effortDropped = true
+            logger?.warn(
+              `dsh-xdpool: ${account.label} refused the thinking level on ${modelId ?? '(none)'} `
+                + `(${result.message.slice(0, 120)}); retrying once without reasoning_effort`,
+            )
+            continue
+          }
+        }
+        // Still refused with no level in the body. The gateway blames "the model
+        // provider", which answers 200 to the same bytes a moment later
+        // (measured), so spend one more attempt before surfacing a 400 the caller
+        // cannot act on. Gated on `effortDropped`: a genuinely malformed body must
+        // not be re-sent, or every 400 would cost the user a duplicate round trip.
+        if (effortDropped && !effortRetried && isEffortRejection(result.message)) {
+          effortRetried = true
+          logger?.warn(
+            `dsh-xdpool: ${account.label} still rejected ${modelId ?? '(none)'} with no thinking level `
+              + `(${result.message.slice(0, 160)}); retrying the same body once`,
+          )
+          // Short pause, not a backoff curve: the refusals measured arrived
+          // within milliseconds of each other on the gateway side, and the
+          // Harness is holding a user turn open while this runs.
+          await new Promise(resolve => setTimeout(resolve, 500))
+          continue
+        }
+        // Every retry this shim can spend has been spent, and the body was
+        // refused anyway. Keep it: the shape summary above cannot show a content
+        // block the gateway does not recognise, and rebuilding the body from the
+        // session log has twice produced a request the gateway accepts.
+        let parsedBody: unknown
+        try {
+          parsedBody = JSON.parse(prepared)
+        } catch {
+          parsedBody = prepared
+        }
+        const dumped = await recordRejectedBody({
+          at: new Date().toISOString(),
+          model: modelId ?? '(none)',
+          account: account.label,
+          status: result.status,
+          upstream: result.message,
+          body: parsedBody,
+        })
         logger?.warn(
           `dsh-xdpool: ${account.label} rejected the request as invalid `
-          + `(model ${modelId ?? '(none)'}) — ${requestShape(raw)}; upstream: ${result.message.slice(0, 300)}`,
+          + `(model ${modelId ?? '(none)'}) — ${requestShape(raw)}; upstream: ${result.message.slice(0, 300)}`
+          + `${dumped === undefined ? '' : `; the refused body is in ${dumped}`}`,
         )
       }
       // Other failures are terminal for this request.
@@ -1674,6 +1746,7 @@ async function recoverFromContextOverrun(options: RecoverOptions): Promise<Recov
               const body = client.buildChatBody(
                 { ...parsed, stream: true, max_tokens: Math.min(Math.max(256, Math.floor(budget / 2)), summariserCap) },
                 request,
+                effectiveRowOf(catalog, modelId)?.supportedEfforts,
               )
               return await client.completeChat(summariser.credential, body, signal ?? controller.signal)
             },
@@ -1696,7 +1769,11 @@ async function recoverFromContextOverrun(options: RecoverOptions): Promise<Recov
       return { ok: false, detail: compactionDetail === '' ? 'compaction could not reduce the prompt' : compactionDetail }
     }
   }
-  let retryBody = client.buildChatBody(parsed, compacted)
+  let retryBody = client.buildChatBody(
+    parsed,
+    compacted,
+    effectiveRowOf(catalog, modelId)?.supportedEfforts,
+  )
   const tried: string[] = []
   // One pairing repair per recovery. A transcript the repair cannot fix is
   // malformed in a way this shim has no answer for, and retrying it forever would
@@ -1753,7 +1830,11 @@ async function recoverFromContextOverrun(options: RecoverOptions): Promise<Recov
         const repaired = recoverToolPairing(compacted)
         if (repaired.changed) {
           compacted = repaired.messages
-          retryBody = client.buildChatBody(parsed, compacted)
+          retryBody = client.buildChatBody(
+            parsed,
+            compacted,
+            effectiveRowOf(catalog, modelId)?.supportedEfforts,
+          )
           logger?.warn(
             `dsh-xdpool: tool-call pairing still broken on ${modelId ?? '(no model)'} `
               + `after compaction (${compacted.length} message(s) left); repairing and retrying once`,

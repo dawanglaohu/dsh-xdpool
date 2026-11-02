@@ -141,6 +141,25 @@ export interface WorkBuddyAdapter {
 function modelInput(info: WorkBuddyModelInfo): ('text' | 'image')[] {
   return info.supportsImages ? ['text', 'image'] : ['text']
 }
+/**
+ * pi-ai compat flags every model served through the loopback shim must carry.
+ *
+ * `supportsDeveloperRole: false` is load-bearing. pi-ai picks the role of the
+ * instruction turn from `model.reasoning && compat.supportsDeveloperRole`, and
+ * its own detection answers "yes" for anything that is neither OpenRouter nor
+ * one of the listed non-standard vendors. The shim's `http://127.0.0.1:<port>/v1`
+ * base URL matches neither, so every reasoning model used to go out as
+ * `role: "developer"`, which WorkBuddy refuses with 400 + business code 11128
+ * (`Illegal API invocation from an unapproved channel`). Measured on the live
+ * gateway: the identical body with that role renamed to `system` answers 200,
+ * and `developer` is the only shape it rejects that way.
+ *
+ * `prepareChatBody` relabels the role as a backstop for anything that still
+ * reaches it, but the request should never leave pi-ai carrying a role the
+ * gateway rejects — a backstop that rewrites the wire is a bug report waiting
+ * to happen the moment the shim is bypassed.
+ */
+const SHIM_COMPAT = { supportsDeveloperRole: false } as const
 /** Map only levels the catalog advertises; undeclared DSH levels stay off. */
 function thinkingLevelMap(info: WorkBuddyModelInfo): Record<string, string | null> | undefined {
   const efforts = info.supportedEfforts
@@ -226,7 +245,7 @@ function toPiModel(info: WorkBuddyModelInfo, baseUrl: string, providerId: string
     maxTokens: info.maxOutputTokens,
     reasoning: map !== undefined,
     ...map === undefined ? {} : { thinkingLevelMap: map },
-    compat: { supportsReasoningEffort: map !== undefined },
+    compat: { ...SHIM_COMPAT, supportsReasoningEffort: map !== undefined },
   } as unknown as Model<Api>
 }
 /**
@@ -254,7 +273,7 @@ function toAggregateModel(row: AggregateModelRow, baseUrl: string, providerId: s
     // "unknown" — which for pi-ai means "do not offer the thinking control"
     // rather than "offer it and send a parameter the provider may reject".
     reasoning: false,
-    compat: { supportsReasoningEffort: false },
+    compat: { ...SHIM_COMPAT, supportsReasoningEffort: false },
   } as unknown as Model<Api>
 }
 /**
@@ -281,7 +300,7 @@ function toComboModel(row: ComboModelRow, baseUrl: string, providerId: string): 
     // that answers understands the parameter, and pi-ai's thinking control maps
     // onto it one-to-one.
     reasoning: false,
-    compat: { supportsReasoningEffort: false },
+    compat: { ...SHIM_COMPAT, supportsReasoningEffort: false },
   } as unknown as Model<Api>
 }
 /**
@@ -315,6 +334,11 @@ function toExtraLaneModel(row: FreeModelRow, baseUrl: string, providerId: string
     maxTokens: row.maxOutput,
     reasoning: row.reasoning,
     ...map === undefined ? {} : { thinkingLevelMap: map },
+    // No `...SHIM_COMPAT` here on purpose. These rows are not answered by
+    // WorkBuddy: the shim hands the caller's body to the lane's own upstream
+    // (a third-party OpenAI-compatible endpoint), so the role the gateway
+    // refuses never reaches it. Forcing `system` here would rewrite what a
+    // different vendor was already accepting.
     compat: { supportsReasoningEffort: map !== undefined },
   } as unknown as Model<Api>
 }

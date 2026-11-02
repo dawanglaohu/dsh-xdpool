@@ -307,6 +307,39 @@ describe('adapter', () => {
     expect(shim.token()).not.toContain('token-')
     expect(shim.token().length).toBeGreaterThan(0)
   })
+
+  it('tells pi-ai the gateway refuses the developer role', async () => {
+    // pi-ai decides the instruction turn's role from
+    // `model.reasoning && compat.supportsDeveloperRole`, and its own detection
+    // answers "yes" for any base URL that is neither OpenRouter nor one of the
+    // listed non-standard vendors — the loopback shim is neither, so every
+    // reasoning model used to go out as `role: "developer"`. The gateway
+    // answers that with 400 + business code 11128 (`Illegal API invocation from
+    // an unapproved channel`); the identical body with the role renamed to
+    // `system` answers 200.
+    //
+    // Asserted on EVERY model, not just the reasoning ones: the flag is cheap,
+    // and a lane that later starts advertising efforts must not silently
+    // reacquire the rejected role.
+    const pool = new WorkBuddyAccountPool({ authDirs: [await fakeAuthDir(1)] })
+    await pool.scan()
+    const shim = createWorkBuddyShim({
+      pool,
+      client: new WorkBuddyUpstreamClient({ fetchImpl: rotationFetch(0, { hit: [] }) as never }),
+      catalog: new WorkBuddyCatalog(),
+    })
+    shims.push(shim)
+    await shim.ready
+
+    const adapter = createWorkBuddyAdapter({ shim, catalog: new WorkBuddyCatalog() })
+    const models = adapter.buildModels()
+    expect(models.length).toBeGreaterThan(0)
+    for (const model of models) {
+      const compat = (model as Record<string, unknown>)['compat'] as Record<string, unknown> | undefined
+      expect(compat, `${String((model as Record<string, unknown>)['id'])} carries compat`).toBeDefined()
+      expect(compat?.['supportsDeveloperRole'], String((model as Record<string, unknown>)['id'])).toBe(false)
+    }
+  })
 })
 
 describe('credit exhaustion (regression)', () => {

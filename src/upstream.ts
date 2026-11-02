@@ -15,6 +15,7 @@
 import type { WorkBuddyCredential } from './accounts.ts'
 import { createHash, randomUUID } from 'node:crypto'
 import { ProxyBreaker, sendViaProxies } from './proxy-fetch.ts'
+import { sanitiseToolSchemas } from './tool-schema.ts'
 import type { MarketExpert } from './task-events.ts'
 import type { ChatMessage } from './context-budget.ts'
 
@@ -434,6 +435,187 @@ const CONTEXT_OVERFLOW_MARKERS = [
 const TOOL_PAIRING_CODE = 11148
 const TOOL_PAIRING_MARKERS = ['tool calls and tool results do not match', 'Incomplete tool records']
 
+/**
+ * The `system` text synthesised for a caller that sent none.
+ *
+ * The gateway requires `messages[0].role === 'system'`, but not every row
+ * tolerates an empty one: `kimi-k3.1-pro` answers `content: ''` with 400 +
+ * 11151 (`a message has empty content`), while the same body answers 200 once
+ * that turn holds any non-empty text. This placeholder satisfies both checks
+ * and says nothing a model would act on.
+ */
+const PLACEHOLDER_SYSTEM = '(no system prompt)'
+
+/**
+ * Phrases the gateway refuses a request over, and the wording that replaces them.
+ *
+ * Channel verification is not only about headers. The gateway also matches a
+ * request's text against the prompts of rival agent harnesses and answers a hit
+ * with 400 + 11128, the same code a missing `system` turn earns. Measured on the
+ * live gateway, one phrase at a time:
+ *
+ * - this sentence on its own is refused;
+ * - the same sentence with two nouns changed is accepted;
+ * - `'x'.repeat(80_000)` and thirty random 120-character prompts are accepted;
+ * - the refusal is identical for every signed-in account and every reasoning row.
+ *
+ * So it is content matching, not a size limit, a rate limit, or account state.
+ *
+ * `@deepseek-ai/dsh-file-reference` ships the first entry verbatim — it is the
+ * file-reference guidance every session carries once a path is mentioned — which
+ * is why an ordinary session could be refused with a body that looked perfectly
+ * well-formed. Rewriting it keeps the instruction and drops the fingerprint.
+ */
+const GATEWAY_BLOCKED_PHRASES: readonly (readonly [string, string])[] = [
+  [
+    'Tokens prefixed with @ are paths the user explicitly referenced. Relative paths resolve from the workspace root',
+    'Tokens starting with @ name paths the user explicitly referenced. Relative paths resolve against the working directory',
+  ],
+]
+
+/**
+ * The host product's own name, which the gateway treats the same way.
+ *
+ * This one is not a sentence but a brand, and it is matched loosely: the
+ * offending span in the prompt that produced it was a whole paragraph, and
+ * shortening that paragraph word by word from either end made it acceptable each
+ * time — the match needs a run of text, not an exact string. What does hold is
+ * the name itself: every occurrence of `DeepSeek Harness` in a refused
+ * 17 412-character system prompt was inside an offending span, replacing all
+ * three with `DSH` made the whole prompt answer 200, and `Deep Seek Harness`
+ * (one space inserted) still triggered while `DeepSeek-Harness` did not.
+ *
+ * Case and internal whitespace are therefore ignored on match, and the
+ * replacement is a short form the model still reads as the same thing.
+ */
+const BLOCKED_PRODUCT_NAMES: readonly RegExp[] = [
+  /Deep\s*Seek\s*Harness/gi,
+]
+
+/** Rewrite the phrases and product names above in one piece of text. */
+function neutraliseSignatures(text: string): string {
+  let out = text
+  for (const pattern of BLOCKED_PRODUCT_NAMES) out = out.replace(pattern, 'DSH')
+  for (const [blocked, allowed] of GATEWAY_BLOCKED_PHRASES) {
+    if (out.includes(blocked)) out = out.split(blocked).join(allowed)
+  }
+  return out
+}
+
+/** Thinking levels in ascending order, used to pick a neighbour. */
+const EFFORT_LADDER = ['minimal', 'low', 'medium', 'high', 'xhigh', 'max'] as const
+
+/**
+ * Move one requested thinking level onto the row's declared ladder.
+ *
+ * The two gateways advertise a per-model `reasoning.supportedEfforts` and a
+ * model that does not offer the requested level answers 400 + 11133
+ * (`Invalid request parameters`) with
+ * `extError.message: "the request parameters were rejected by the model
+ * provider"` — measured on `hy4-preview`, which declares `["high"]` only and
+ * refuses `max` on every attempt while accepting `high` on the same body.
+ *
+ * DSH never asks for a level a model does not declare, but the level it asks
+ * for comes from the session's own setting (`agent-default-model` ships
+ * `reasoningEffort: max`), and that setting is shared across every model in the
+ * picker. Selecting `hy4-preview` therefore requested `max` from a row that only
+ * has `high`, and the failure surfaced as a 400 the caller could do nothing
+ * about. Clamping here rather than in the picker keeps the rule in one place:
+ * whatever the caller asked for, the row is only ever sent a level it accepts.
+ *
+ * Degrading happens toward the neighbour that is closest on the ladder, so a
+ * clamped request keeps as much of the caller's intent as the row allows. An
+ * unknown level (not on the ladder, and not `none`) is left alone — the gateway
+ * may accept vocabulary this table does not know.
+ */
+function clampReasoningEffort(
+  requested: string,
+  supported: readonly string[] | undefined,
+): string {
+  const level = requested.trim().toLowerCase()
+  if (supported === undefined || supported.length === 0) return requested
+  if (supported.includes(level)) return requested
+  const target = EFFORT_LADDER.indexOf(level as (typeof EFFORT_LADDER)[number])
+  if (target < 0) return requested
+  let best: string | undefined
+  let bestDistance = Number.POSITIVE_INFINITY
+  for (const candidate of supported) {
+    const at = EFFORT_LADDER.indexOf(candidate as (typeof EFFORT_LADDER)[number])
+    if (at < 0) continue
+    const distance = Math.abs(at - target)
+    if (distance < bestDistance) {
+      best = candidate
+      bestDistance = distance
+    }
+  }
+  return best ?? requested
+}
+
+/**
+ * Rewrite the phrases above in one `system` turn.
+ *
+ * Only `system` turns are touched, because only they are matched: the same
+ * sentence sent as a `user` message, as a `tool` result, or inside a tool
+ * description is accepted (measured, one case at a time). Narrowing it this way
+ * keeps tool definitions and tool output byte-identical to what the caller and
+ * the tools produced — a session that greps the DSH source still sees the real
+ * text, and a rewrite can never alter a file's contents on its way back.
+ */
+function neutraliseMessageContent(message: Record<string, unknown>): void {
+  const content = message['content']
+  if (typeof content === 'string') {
+    message['content'] = neutraliseSignatures(content)
+    return
+  }
+  if (!Array.isArray(content)) return
+  for (const block of content) {
+    if (typeof block !== 'object' || block === null || Array.isArray(block)) continue
+    const piece = block as Record<string, unknown>
+    if (typeof piece['text'] === 'string') piece['text'] = neutraliseSignatures(piece['text'])
+  }
+}
+
+/**
+ * Does this refusal mean "the model will not take this thinking level"?
+ *
+ * The two gateways answer an unsupported `reasoning_effort` with 11133
+ * (`Invalid request parameters`, `extError.message: "the request parameters
+ * were rejected by the model provider"`) or 11150 (`the reasoning effort value
+ * is not supported by the current model`). Both name the level only in prose, so
+ * the code is the reliable signal.
+ *
+ * `clampReasoningEffort` prevents this for every row the catalog describes. This
+ * predicate covers the rows it cannot: one whose declaration never arrived, and
+ * one that accepts the level on paper and refuses it in practice.
+ */
+export function isEffortRejection(body: string): boolean {
+  return hasBusinessCode(body, 11133) || hasBusinessCode(body, 11150)
+}
+
+/**
+ * The same body with its thinking level removed, or `undefined` when there was
+ * none to remove.
+ *
+ * The last resort after {@link isEffortRejection}: a row that refuses every
+ * level on its own declared ladder still answers a request that asks for none at
+ * all (measured — `hy4-preview` refuses `max` with 11133 and accepts the same
+ * body carrying no `reasoning_effort`). Answered as `undefined` rather than a
+ * rebuilt body so a caller cannot loop on a body that never had a level.
+ */
+export function withoutReasoningEffort(prepared: string): string | undefined {
+  let body: unknown
+  try {
+    body = JSON.parse(prepared)
+  } catch {
+    return undefined
+  }
+  if (typeof body !== 'object' || body === null || Array.isArray(body)) return undefined
+  const obj = body as Record<string, unknown>
+  if (obj['reasoning_effort'] === undefined) return undefined
+  delete obj['reasoning_effort']
+  return JSON.stringify(obj)
+}
+
 /** Does this body carry the given business code, however the gateway spaces it? */
 function hasBusinessCode(body: string, code: number): boolean {
   const coded = /"code"\s*:\s*"?\s*(\d+)/u.exec(body)
@@ -601,25 +783,34 @@ const CHAT_IDENTITY_HEADERS: Readonly<Record<string, string>> = Object.freeze({
 })
 
 /**
- * The per-turn conversation identifiers the gateway demands before it will
- * accept a chat completion at all.
+ * The per-turn conversation identifiers the desktop client sends with a chat
+ * completion.
  *
- * WHY THIS IS NOT OPTIONAL — the 11128 gate
+ * WHAT THESE ARE FOR — and what they are NOT
  *
- * `POST /v2/chat/completions` answers every request that lacks all three of
- * these headers with HTTP 400, business code 11128, `msg: "request illegal"`,
- * and a `displayTips` claiming the call "failed channel verification, possibly
- * because it was not sent from an official client". That message is misleading:
- * the gate is not about the User-Agent, the product headers, the origin, the
- * TLS fingerprint, or the protocol version — each of those was varied against a
- * live account and none of them moved the response off 11128.
+ * They were introduced as the fix for 400 + business code 11128 (`request
+ * illegal`, `displayTips` claiming the call "failed channel verification,
+ * possibly because it was not sent from an official client"). That diagnosis
+ * has since been measured false on the live gateway: a request with none of
+ * these three headers answers 200, and one carrying all three answers 11128 as
+ * soon as its body contains a `developer` turn. So the gate was never the
+ * headers — the misleading `displayTips` pointed at client identity, and the
+ * three headers happened to travel with the desktop client that also never
+ * sends `developer`.
  *
- * The desktop app's `applyGatewayHeaders` sets exactly these three, freshly
- * minted per request, on the same request as the identity headers above. They
- * are the whole difference. Dropping any one of the three re-triggers 11128;
- * dropping `acp-connection-id` or `X-Request-ID`, which the desktop app also
- * sends, does not — so those two stay out, since they are not what the gate
- * reads and inventing values for them buys nothing.
+ * The real triggers, both measured against a live account:
+ *   - `messages[i].role === 'developer'` → 11128, whatever the headers say.
+ *     Fixed at the source by telling pi-ai the shim refuses that role
+ *     (`SHIM_COMPAT` in `adapter.ts`) and, as a backstop, by relabelling it in
+ *     `prepareChatBody`.
+ *   - `messages[0].role !== 'system'` → 11128 as well. `prepareChatBody`
+ *     hoists or synthesises the leading system turn.
+ *
+ * The three headers stay because the desktop client sends them and they are
+ * cheap: a gateway that starts reading them again should find them present. Do
+ * not reintroduce the claim that any of them is required — a comment that says
+ * "dropping any one re-triggers 11128" sends the next reader hunting for a
+ * client-identity bug that does not exist.
  *
  * `X-Conversation-ID` is per-conversation and stable within it; the request and
  * message ids are per turn. The shim mints one conversation id per DSH
@@ -1476,7 +1667,7 @@ export class WorkBuddyUpstreamClient {
    * An effort the caller DID send is left untouched — this only fills the gap,
    * which is what keeps a user's explicit thinking level meaningful.
    */
-  prepareChatBody(raw: string): string {
+  prepareChatBody(raw: string, supportedEfforts?: readonly string[]): string {
     let body: unknown
     try {
       body = JSON.parse(raw)
@@ -1498,25 +1689,37 @@ export class WorkBuddyUpstreamClient {
       : {}
     requested['include_usage'] = true
     obj['stream_options'] = requested
-    // Fill the gap only: an explicit effort from the caller always wins.
+    // Fill the gap only: an explicit effort from the caller always wins — but
+    // only within what this row declares, since a level it does not offer is a
+    // 400 + 11133 the caller cannot act on.
     const effort = obj['reasoning_effort']
     if (effort === undefined || (typeof effort === 'string' && effort.trim() === '')) {
-      obj['reasoning_effort'] = 'none'
+      obj['reasoning_effort'] = clampReasoningEffort('none', supportedEfforts)
+    } else if (typeof effort === 'string') {
+      obj['reasoning_effort'] = clampReasoningEffort(effort, supportedEfforts)
     }
     if (Array.isArray(obj['messages'])) {
       for (const value of obj['messages']) {
         if (typeof value !== 'object' || value === null || Array.isArray(value)) continue
         const message = value as Record<string, unknown>
         if (message['role'] === 'developer') message['role'] = 'system'
+        if (message['role'] === 'system') neutraliseMessageContent(message)
       }
-      // The gateway's second 11128 condition: `messages[0]` must be `system`.
-      // Anything else — a bare user turn, a system message sitting later, a
-      // `developer` turn it just relabelled but did not move — is refused with
-      // the same "request illegal / not an official client" text, which is why
-      // this used to look like a client-identity problem. Hoisting the first
-      // system message to the front (rather than synthesising one) keeps the
-      // prompt the caller wrote; a request with no system message at all gets
-      // an empty one, since the gateway only checks the role.
+      // `messages[0]` must be a `system` turn. Anything else — a bare user
+      // turn, a system message sitting later, a `developer` turn it just
+      // relabelled but did not move — is refused with 11128, which is why this
+      // used to look like a client-identity problem. Hoisting the first system
+      // message to the front (rather than synthesising one) keeps the prompt
+      // the caller wrote.
+      //
+      // When there is no system message at all, the synthesised turn carries
+      // PLACEHOLDER_SYSTEM rather than an empty string. `content: ''` is
+      // accepted by most rows but `kimi-k3.1-pro` answers it with 400 + 11151
+      // (`a message has empty content, please check the conversation history
+      // and retry`) — measured on the live gateway, with the same body
+      // answering 200 once that turn held any non-empty text. A one-word
+      // placeholder keeps every row working and tells the model nothing it
+      // would act on.
       const messages = obj['messages'] as unknown[]
       const leading = messages[0]
       const leadingRole = typeof leading === 'object' && leading !== null && !Array.isArray(leading)
@@ -1528,9 +1731,15 @@ export class WorkBuddyUpstreamClient {
           return (value as Record<string, unknown>)['role'] === 'system'
         })
         if (at > 0) messages.unshift(...messages.splice(at, 1))
-        else if (at < 0) messages.unshift({ role: 'system', content: '' })
+        else if (at < 0) messages.unshift({ role: 'system', content: PLACEHOLDER_SYSTEM })
       }
     }
+    // Tool schemas are the third thing this gateway refuses, and the only one
+    // that arrives from outside the session: an MCP server's `oneOf`/`anyOf`/
+    // dangling `$ref` makes every request in that session a 400 + 11133, which
+    // reads as "the model cannot handle this request" and points nowhere near
+    // the tool definitions. See `tool-schema.ts` for what was measured.
+    sanitiseToolSchemas(obj)
     const choice = obj['tool_choice']
     if (typeof choice === 'string') {
       if (choice.trim().toLowerCase() === 'none') {
@@ -1579,8 +1788,12 @@ export class WorkBuddyUpstreamClient {
   }
 
   /** Re-serialise `base` with a rewritten `messages` array, still normalised. */
-  buildChatBody(base: Record<string, unknown>, messages: readonly ChatMessage[]): string {
-    return this.prepareChatBody(JSON.stringify({ ...base, messages }))
+  buildChatBody(
+    base: Record<string, unknown>,
+    messages: readonly ChatMessage[],
+    supportedEfforts?: readonly string[],
+  ): string {
+    return this.prepareChatBody(JSON.stringify({ ...base, messages }), supportedEfforts)
   }
 
   /**

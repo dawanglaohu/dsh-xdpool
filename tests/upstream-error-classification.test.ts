@@ -1,4 +1,4 @@
-/**
+﻿/**
  * Upstream failure classification, with the "API 密钥无效" regression pinned.
  *
  * The bug, restated
@@ -21,7 +21,7 @@
  */
 
 import { describe, expect, it } from 'vitest'
-import { classifyUpstreamError } from '../src/upstream.ts'
+import { classifyUpstreamError, isEffortRejection, withoutReasoningEffort } from '../src/upstream.ts'
 
 describe('classifyUpstreamError — recoverable classes must rotate', () => {
   it('treats any HTTP 401 as a dead session, whatever the body says', () => {
@@ -111,3 +111,48 @@ describe('classifyUpstreamError — recoverable classes must rotate', () => {
     expect(classifyUpstreamError(400, 'bad request')).toBe('client')
   })
 })
+
+describe('effort rejection — the row refused the thinking level', () => {
+  it('recognises both codes the gateways use', () => {
+    // 11133 arrives from the model provider with the level named only in prose;
+    // 11150 says "the reasoning effort value is not supported by the current
+    // model". Both were measured on `hy4-preview`, which declares `["high"]`
+    // only, against a session requesting `max`.
+    const invalid = JSON.stringify({
+      code: 11133,
+      msg: 'Invalid request parameters',
+      extError: {
+        code: '400001',
+        message: 'the request parameters were rejected by the model provider',
+        type: 'invalid_request_error',
+      },
+    })
+    const unsupported = JSON.stringify({
+      code: 11150,
+      msg: 'the reasoning effort value is not supported by the current model',
+    })
+    expect(isEffortRejection(invalid)).toBe(true)
+    expect(isEffortRejection(unsupported)).toBe(true)
+  })
+
+  it('does not claim an unrelated 400 belongs to the level', () => {
+    // These are terminal for a different reason and must not spend the one
+    // dropped-level retry: the body would be resent unchanged and fail again.
+    expect(isEffortRejection(JSON.stringify({ code: 11128, msg: 'Illegal API invocation' }))).toBe(false)
+    expect(isEffortRejection(JSON.stringify({ code: 11151, msg: 'a message has empty content' }))).toBe(false)
+    expect(isEffortRejection('bad request')).toBe(false)
+  })
+
+  it('strips the level, and reports nothing to strip when there was none', () => {
+    const prepared = JSON.stringify({ model: 'hy4-preview', reasoning_effort: 'high', messages: [] })
+    const stripped = withoutReasoningEffort(prepared)
+    expect(stripped).toBeDefined()
+    expect(JSON.parse(stripped as string)['reasoning_effort']).toBeUndefined()
+    expect(JSON.parse(stripped as string)['model']).toBe('hy4-preview')
+    // `undefined` rather than an identical body: the shim retries once per
+    // request, and a body with no level would otherwise loop on itself.
+    expect(withoutReasoningEffort(JSON.stringify({ model: 'm', messages: [] }))).toBeUndefined()
+    expect(withoutReasoningEffort('not json')).toBeUndefined()
+  })
+})
+
