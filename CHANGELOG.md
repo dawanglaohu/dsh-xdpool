@@ -1,7 +1,7 @@
 # Changelog
 本项目的所有重要变更都会记录在此文件。
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
-## 2.4.10 — 400 落在哪个码上就报哪个原因：11128 有三个触发器，11133 是另一回事
+## 2.5.2 — 400 落在哪个码上就报哪个原因：11128 有三个触发器，11133 是另一回事
 > 现象是「用国内版账号聊天，回 `workbuddy upstream client (http 400) after 1 account(s) [🍀眠#…]: {"code":11128,"msg":"Illegal API invocation from an unapproved channel"}`」，之后在另一条会话里变成 `{"code":11133,"msg":"Invalid request parameters"}`。2.3.0 把 11128 归因成「缺三个会话标识头」，理由是当时的 `displayTips` 说「这次调用没通过渠道校验，可能不是官方客户端发出的」。**那条提示是误导**。
 >
 > 对着活网关逐项做过 bisect：去掉三个会话头、换 UA、换 `X-IDE-Version`、去掉 `X-Product`、换模型名、加 2 MB body —— 全部 200。唯一能把 200 变回 400/11128 的，是 `messages` 里出现 `role: "developer"`（放在首条、末尾、夹在中间都一样）。
