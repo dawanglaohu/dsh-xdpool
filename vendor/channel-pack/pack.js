@@ -34316,6 +34316,13 @@ var CODEBUDDY = {
   defaultCredentialRef: "BUDDY_ACCESS_TOKEN",
   appendSessionParams: true,
   pluginVersion: "5.8.3",
+  // 扫码登录的等待预算：只够一次扫码。
+  // 2026-10 起国内登录页换成了 /signin/* 那套网页登录（`assets.workbuddy.cn`
+  // 的 `index-*.js` 里没有任何 `/v2/plugin/` 引用），登录成功后只跳
+  // `workbuddy://` 深链让客户端接管，**不再回写** `/v2/plugin/auth/token`。
+  // 于是 `loopGetToken` 无论扫没扫码都只会拿到 11217，等满五分钟毫无意义 ——
+  // 超时就把「该去哪里完成登录」讲清楚，而不是让用户对着转圈等。
+  loginTimeoutMs: 120000,
   fallbackModels: CODEBUDDY_FALLBACK_MODELS
 };
 var WORKBUDDY_FALLBACK_MODELS = [
@@ -44067,10 +44074,10 @@ async function loopGetToken(state, options = {}) {
     [HTTP_HEADER_NO_AUTHORIZATION]: "true",
     "User-Agent": product.userAgent
   };
-  const deadline = Date.now() + (options.timeoutMs ?? LOGIN_TIMEOUT_MS);
+  const deadline = Date.now() + (options.timeoutMs ?? product.loginTimeoutMs ?? LOGIN_TIMEOUT_MS);
   const interval = options.pollIntervalMs ?? POLL_INTERVAL_MS;
   for (; ; ) {
-    if (Date.now() >= deadline) throw new Error("\u83B7\u53D6 token \u8D85\u65F6\uFF085 \u5206\u949F\uFF09");
+    if (Date.now() >= deadline) throw new Error("\u83B7\u53D6 token \u8D85\u65F6\uFF1A\u6D4F\u89C8\u5668\u91CC\u5B8C\u6210\u767B\u5F55\u540E\u672A\u56DE\u5199\u51ED\u636E");
     if (options.signal?.aborted) throw new Error("\u767B\u5F55\u5DF2\u53D6\u6D88");
     await sleep(interval);
     let result;
@@ -44119,10 +44126,10 @@ async function getAccount(state, token, options = {}) {
     [HTTP_HEADER_NO_ENTERPRISE_ID]: "true",
     "User-Agent": (options.product ?? CODEBUDDY).userAgent
   };
-  const deadline = Date.now() + (options.timeoutMs ?? LOGIN_TIMEOUT_MS);
+  const deadline = Date.now() + (options.timeoutMs ?? product.loginTimeoutMs ?? LOGIN_TIMEOUT_MS);
   const interval = options.pollIntervalMs ?? POLL_INTERVAL_MS;
   for (; ; ) {
-    if (Date.now() >= deadline) throw new Error("\u83B7\u53D6\u8D26\u6237\u4FE1\u606F\u8D85\u65F6\uFF085 \u5206\u949F\uFF09");
+    if (Date.now() >= deadline) throw new Error("\u83B7\u53D6\u8D26\u6237\u4FE1\u606F\u8D85\u65F6\uFF1A\u767B\u5F55\u5DF2\u5B8C\u6210\u4F46\u672A\u62FF\u5230\u8D26\u53F7");
     if (options.signal?.aborted) throw new Error("\u767B\u5F55\u5DF2\u53D6\u6D88");
     await sleep(interval);
     let result;
@@ -44318,6 +44325,30 @@ async function runBuddyLoginFlow(options = {}) {
     loginUrl: authUrl,
     refreshable: isRefreshable(credential)
   };
+}
+
+/**
+ * 把后台登录失败的原因翻成用户能照做的一句话。
+ *
+ * 国内登录页（`www.workbuddy.cn/login`）从 2026-10 起是 `/signin/*` 那套网页
+ * 登录：`assets.workbuddy.cn/web/login/<hash>/assets/index-*.js` 里**一个
+ * `/v2/plugin/` 都没有**，登录成功只跳 `workbuddy://` 深链交给桌面客户端。
+ * 所以插件的 `auth/token` 轮询必然拿不到凭据 —— 这既不是网络问题也不是超时
+ * 设短了，重复试不会变好。原样抛出 `获取 token 超时` 会让人以为是慢，于是
+ * 一遍遍重扫，所以这里换成可执行的指引。
+ *
+ * 国际版登录页仍是插件握手那一套（`/v2/plugin/auth/token` 会回 200 的
+ * 11217 直到扫码完成），失败就是真失败，保留原始报文更有诊断价值。
+ */
+function buddyLoginFailureHint(product, error) {
+  const reason = error instanceof Error ? error.message : String(error);
+  if (product.login !== void 0) {
+    return "\u56FD\u5185\u7248\u767B\u5F55\u9875\u5DF2\u6539\u4E3A\u7F51\u9875\u767B\u5F55\uFF0C"
+      + "\u626B\u7801\u540E\u4E0D\u518D\u56DE\u5199\u63D2\u4EF6\u51ED\u636E\uFF08" + reason + "\uFF09"
+      + "\u3002\u8BF7\u5728 WorkBuddy \u5BA2\u6237\u7AEF\u5B8C\u6210\u767B\u5F55\uFF0C"
+      + "\u518D\u56DE\u5230\u8D26\u53F7\u5361\u70B9\u300C\u91CD\u65B0\u68C0\u6D4B\u8D26\u53F7\u300D\u3002";
+  }
+  return reason;
 }
 
 // vendor/channel-pack/src/buddy-auth.ts
@@ -61516,6 +61547,13 @@ function registerChannelPackEndpoints(ctx, pool, codearts, buddy, workbuddy, lob
             });
           }).catch((err) => {
             ctx.logger.warn(`[channel-pack] background ${product.id} login failed for ${id}: ${err}`);
+            // ⚠️ 失败原因必须留给 `login.poll`，不能只写日志。
+            // 2026-10 起国内登录页换成 `/signin/*` 那套网页登录，扫码成功后只跳
+            // `workbuddy://` 深链，不再回写 `/v2/plugin/auth/token`；`loopGetToken`
+            // 于是必然超时。此前这里只 `logger.warn` 加删号，前端轮询找不到 entry
+            // 就一路 `{done:false}`，用户等满十分钟只看到一句「登录失败」，真正原因
+            // 一个字的提示都没有。Gemini 分支早就这么做了，这里补齐同一形态。
+            pendingLoginFailures.set(id, buddyLoginFailureHint(product, err).slice(0, 500));
             void pool.removeAccount(id).catch(() => {
             });
           });

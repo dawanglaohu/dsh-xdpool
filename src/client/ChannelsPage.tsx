@@ -13,6 +13,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   POOL_CHANNELS_PATH,
+  POOL_RESCAN_PATH,
   ROUTE_OWNED_ELSEWHERE,
   type PoolWebChannel,
   type PoolWebChannelsStatus,
@@ -33,12 +34,14 @@ const POLL_INTERVAL_MS = 2_000
 /**
  * How long to keep checking before giving up.
  *
- * A scan-and-confirm login is normally seconds; ten minutes covers a phone
- * delay, a wrong first account and a re-read of the terms. Beyond that the user
- * has almost certainly walked away, and polling forever would hold a pending
- * account open for a session nobody is watching.
+ * A scan-and-confirm login is normally seconds. This is the backstop for a poll
+ * that never resolves at all — the pack's own budget is what normally ends a
+ * login (and it answers `{done:true, success:false}` with a reason, which the
+ * row prints). Three minutes is three times the pack's budget, so a stuck
+ * interval can no longer hold a pending row open for ten minutes after the pack
+ * already gave up, which read as "nothing happened" rather than "it failed".
  */
-const POLL_TIMEOUT_MS = 10 * 60_000
+const POLL_TIMEOUT_MS = 3 * 60_000
 /** Per-channel UI phase. `signing-in` carries the pending login while it waits. */
 type ChannelPhase = 'idle' | 'signing-in' | 'done' | 'failed'
 interface ChannelUiState {
@@ -244,7 +247,14 @@ export function ChannelsPage({ t }: ChannelsPageProps) {
           phase: 'signing-in',
           accountId: created.accountId,
           loginUrl: created.loginUrl,
-          message: t?.('chan.waiting'),
+          // The pool-owned lanes are the two WorkBuddy ones, and their vendor
+          // page ends on `workbuddy://` — the desktop app takes the session and
+          // no plugin credential is ever written. Saying "finish in the page
+          // that just opened, then come back" there describes a callback that
+          // will not arrive; this instead names the app that has to be running.
+          message: channel.ownedByPool
+            ? t?.('chan.waitingDesktop')
+            : t?.('chan.waiting'),
         },
       }))
       watch(channel, created.accountId, Date.now())
@@ -255,6 +265,39 @@ export function ChannelsPage({ t }: ChannelsPageProps) {
     stopPolling(channelId)
     setUi(prev => ({ ...prev, [channelId]: IDLE }))
   }, [stopPolling])
+  /**
+   * Re-scan the pool's own account sources, from a channel row.
+   *
+   * The row needs this because of how the WorkBuddy lanes now sign in: their
+   * vendor login page hands the finished session to the DESKTOP app
+   * (`workbuddy://`) instead of writing a plugin credential, so a scan there
+   * legitimately produces no `login.poll` result. What it does produce is a new
+   * credential file in the desktop app's auth directory, which is exactly what
+   * the pool's own rescan reads — so the recovery path is one click from the
+   * failure the user is looking at, not a trip to another page.
+   *
+   * The same route the pool card's "Detect accounts again" button posts to, so
+   * a channel row and the pool card cannot drift on what a rescan means.
+   */
+  const rescanPool = useCallback(async (channelId: string): Promise<void> => {
+    setUi(prev => ({ ...prev, [channelId]: { phase: 'signing-in', message: t?.('chan.rescanning') } }))
+    try {
+      const response = await fetch(POOL_RESCAN_PATH, {
+        method: 'POST', headers: { accept: 'application/json' }, credentials: 'same-origin',
+      })
+      const body = await response.json().catch(() => undefined) as { accounts?: number; error?: string } | undefined
+      if (!response.ok) throw new Error(body?.error ?? `HTTP ${response.status}`)
+      await loadConnected().catch(() => {})
+      if (!mounted.current) return
+      setUi(prev => ({ ...prev, [channelId]: { phase: 'done' } }))
+    } catch (cause: unknown) {
+      if (!mounted.current) return
+      setUi(prev => ({
+        ...prev,
+        [channelId]: { phase: 'failed', message: cause instanceof Error ? cause.message : String(cause) },
+      }))
+    }
+  }, [loadConnected, t])
   /**
    * Channels with at least one account, not accounts in total.
    *
@@ -372,6 +415,7 @@ export function ChannelsPage({ t }: ChannelsPageProps) {
           connectedCount={connectedFor(channel).length}
           onSignIn={() => { void signIn(channel) }}
           onCancel={() => cancel(channel.id)}
+          onRescan={() => { void rescanPool(channel.id) }}
         />
       ))}
     </div>
@@ -384,6 +428,7 @@ interface ChannelRowProps {
   connectedCount: number
   onSignIn: () => void
   onCancel: () => void
+  onRescan: () => void
 }
 function ChannelRow({
   channel,
@@ -392,6 +437,7 @@ function ChannelRow({
   connectedCount,
   onSignIn,
   onCancel,
+  onRescan,
 }: ChannelRowProps) {
   const busy = ui.phase === 'signing-in'
   const icon = channelIcon(channel.id)
@@ -465,9 +511,23 @@ function ChannelRow({
               <span className="dsm-xdpool-channel-ok">{t?.('chan.done') ?? 'Account added'}</span>
             )}
             {ui.phase === 'failed' && (
-              <span className="dsm-xdpool-channel-error">
-                {ui.message ?? t?.('chan.failed') ?? 'Sign-in failed'}
-              </span>
+              <>
+                <span className="dsm-xdpool-channel-error">
+                  {ui.message ?? t?.('chan.failed') ?? 'Sign-in failed'}
+                </span>
+                {/* The two WorkBuddy lanes are signed in by the DESKTOP app, not
+                    by this page: their vendor login page finishes on
+                    `workbuddy://` and the credential lands in the desktop app's
+                    auth directory, where no `login.poll` can see it. So the
+                    failure's remedy is a pool rescan, and putting it here means
+                    the user acts on the sentence they just read instead of
+                    hunting for the pool card's own button. */}
+                {channel.ownedByPool && (
+                  <button type="button" className="dsm-xdpool-btn" onClick={onRescan}>
+                    {t?.('chan.rescan') ?? 'Detect accounts again'}
+                  </button>
+                )}
+              </>
             )}
           </>
         )}

@@ -16,6 +16,33 @@
 
 端到端：改后 `model/test` 对 `-sg` 返回 `{"ok":true,"outputChars":5,"firstFrameMs":1283}`；`tsc` 与 1128 条测试全绿。
 
+## 2.5.4 — 国内扫码登录扫完不入池：厂商登录页已经不回写插件凭据了
+> 现象是「在扫码登录页点 WorkBuddy 国内版的『添加账号』，浏览器里扫码、确认、显示登录成功，回到卡片一直转圈，十分钟后只说一句『登录失败』，账号池里什么也没有」。国际版同一条链路正常。
+
+### 根因：登录页换了实现，握手那一半没了
+插件的扫码登录是「拿 `state` → 开登录页 → 轮询 `/v2/plugin/auth/token` 取凭据」三段。前两段现在仍然成立（`POST www.workbuddy.cn/v2/plugin/auth/state?platform=workbuddy` 回 200 并给出 `authUrl`），**第三段已经不成立了**：
+
+- 登录页实际加载的是 `assets.workbuddy.cn/web/login/e79910b7…/assets/index-DnqkLZmC.js`（173 KB），里面 `/v2/plugin/` 出现 **0 次**；
+- 它的登录流程走 `/signin/sso/login`、`/signin/oneid/exchange`、`/signin/phone/verify`、`/signin/account/select`、`/signin/finalize` 这五条自有接口；
+- 成功页（`LoginSuccess-MbMZYLhc.js`）只做三件事：拉账号、落 web 会话、`window.location.href = "workbuddy://"`。`platform=workbuddy` 或带 `loginSessionId` 的进入被判定为 `originClient="desktop"`、`externalOwner=true` —— 页面的态度很明确：**这次登录归桌面客户端所有**。
+
+于是 `loopGetToken` 无论扫没扫码都只会拿到 `11217`（`login ing...`），等满 5 分钟抛超时；`account.create` 的 `.catch` 又只写 `ctx.logger.warn` 并把占位账号 `removeAccount` 掉，`login.poll` 在 `pool.listAllAccounts()` 里找不到 entry，只能一路回 `{done:false}` 直到前端十分钟兜底超时。**真正的原因从来没到达过页面。**
+
+这不是 2.5.3 改坏的：`settings-legacy.yaml` 里 `buddy-ff1a6182`（10-22）、`buddy-4af85c08`（10-24）两条 channel-pack 账号，凭据 ref 与 `.credentials.yaml` 的 `BUDDY_ACCOUNT_27434EE6` / `BUDDY_ACCOUNT_D9DD42D7` 对得上 —— 老版登录页上这条链路是通的。
+
+### 三处修改（`vendor/channel-pack/pack.js` + 前端）
+1. **失败原因回到轮询端**。`account.create` 的 buddy 分支在 `.catch` 里补 `pendingLoginFailures.set(id, …)`（Gemini 分支早就是这个形态），`login.poll` 第一行就会把它取走并回 `{done:true, success:false, error}`。以前这个 Map 对 buddy 只读不写，等于整条失败通道是死的。
+2. **换掉误导的文案**。新增 `buddyLoginFailureHint(product, error)`：国内版（有 `product.login`）回一句能照做的指引 ——「国内版登录页已改为网页登录，扫码后不再回写插件凭据。请在 WorkBuddy 客户端完成登录，再回到账号卡点『重新检测账号』」；国际版仍是插件握手，原样透出报文（那里超时是真故障，改写会毁掉诊断价值）。
+3. **等待预算与超时文案**。国内版 `loginTimeoutMs: 120000`（原来 5 分钟），两处轮询的 deadline 都改成 `options.timeoutMs ?? product.loginTimeoutMs ?? LOGIN_TIMEOUT_MS`，抛出的文案也从「超时（5 分钟）」改成描述事实的「浏览器里完成登录后未回写凭据」。国际版不受影响（不设该字段即沿用模块默认）。
+
+前端配套（`src/client/ChannelsPage.tsx`）：`ownedByPool` 的两条 WorkBuddy 车道在等待中显示「会话由 WorkBuddy 客户端接管，回来后点『重新检测账号』」；失败行多一个「重新检测账号」按钮，直接 `POST /plugins/dsh-xdpool/accounts/rescan`（和账号卡那颗按钮同一条路由，两处不会对「重扫」的含义产生分歧）；页面兜底超时从 10 分钟收到 3 分钟 —— 正常终结登录的是包自己的预算，页面只兜「轮询根本不返回」。
+
+### 现在能用的登录路径
+在 WorkBuddy 客户端登录，然后点「重新检测账号」（内部 `pool.scan()` → `seedCatalog()` → `invalidateCatalog()`）。池里现有 13 个账号全部来自 `CodeBuddyExtension\…\auth\*.info`，就是这条路的产物。
+
+### 测试
+新增 `tests/buddy-login-timeout.test.ts`（7 条）：国内版预算 120 s、国际版不设预算、两处 deadline 都认产品预算（只改一处等于登录成功后还要再等五分钟）、指引文案含「重新检测账号」且保留原始原因、国际版报文原样透出、`pendingLoginFailures` 确实被写入且随后删号。全量 90 文件 / 1137 条通过，`tsc` 干净。
+
 ## 2.5.2 — 400 落在哪个码上就报哪个原因：11128 有三个触发器，11133 是另一回事
 > 现象是「用国内版账号聊天，回 `workbuddy upstream client (http 400) after 1 account(s) [🍀眠#…]: {"code":11128,"msg":"Illegal API invocation from an unapproved channel"}`」，之后在另一条会话里变成 `{"code":11133,"msg":"Invalid request parameters"}`。2.3.0 把 11128 归因成「缺三个会话标识头」，理由是当时的 `displayTips` 说「这次调用没通过渠道校验，可能不是官方客户端发出的」。**那条提示是误导**。
 >
