@@ -160,11 +160,19 @@ describe('each region falls back to its OWN table', () => {
     }
   })
 
-  it('still names the same models on both sides', () => {
+  it('still names the same models on both sides, plus the international-only rows', () => {
     // Stripping the badges must not empty the picker: an unreachable gateway
     // degrades the roster, it does not delete the user's models.
-    expect(fallbackModelsFor('global').map(m => m.id))
-      .toEqual(fallbackModelsFor('cn').map(m => m.id))
+    //
+    // The international table is allowed to carry rows the domestic one does
+    // not: `deepseek-v4.1-flash-sg` is the Singapore-priced twin of the CN
+    // `deepseek-v4.1-flash`, and the domestic gateway answers 11102 for it. What
+    // must stay true is the other direction — a global fallback may never LACK a
+    // row the CN table has, because both gateways serve the shared roster.
+    const cn = fallbackModelsFor('cn').map(m => m.id)
+    const global = fallbackModelsFor('global').map(m => m.id)
+    expect(global).toEqual(expect.arrayContaining(cn))
+    expect(global.filter(id => !cn.includes(id))).toEqual(['deepseek-v4.1-flash-sg'])
   })
 
   it('the catalog falls back per region, and reports the gap in the error only', () => {

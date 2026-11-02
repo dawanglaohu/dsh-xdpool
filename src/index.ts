@@ -11,7 +11,7 @@ import z from '@deepseek-ai/schemastery'
 import type { SettingsNamespace } from '@deepseek-ai/dsh-settings'
 import { WorkBuddyAccountPool, workbuddyAccountId } from './accounts.ts'
 import type { WorkBuddyCredential } from './accounts.ts'
-import { WorkBuddyCatalog } from './catalog.ts'
+import { WorkBuddyCatalog, describeModelRouteGap, modelRouteGap } from './catalog.ts'
 import {
   mountChannelPack,
   POOL_OWNED_CHANNELS,
@@ -1274,6 +1274,35 @@ function canonicalJson(value: unknown): string {
   // Same-origin routes backing the XD Pool settings card. `webServer`
   // is an optional service: on a headless profile without it, no card routes
   // mount and the card shows an offline banner — the provider still works.
+  /**
+   * Which catalog a provider id reads its roster from, or undefined for a lane
+   * this plugin does not own.
+   *
+   * The connection test is offered on every row of every model page, and the
+   * pages are not all pool pages: the aggregate lane and the free lane have
+   * their own ids and their own rosters. Mapping the id here keeps the
+   * diagnosis honest — a lane with no catalog of ours gets no guess.
+   */
+  const catalogForProvider = (provider: string): WorkBuddyCatalog | undefined => {
+    if (provider === POOL_PROVIDER_BY_REGION.cn) return core.catalogs.cn
+    if (provider === POOL_PROVIDER_BY_REGION.global) return core.catalogs.global
+    return undefined
+  }
+  /**
+   * Explain why a provider cannot serve `model`, when this plugin knows.
+   *
+   * Undefined means "let the host decide" — the lane is not ours, or the id is
+   * routable and the call should proceed. The wording lives in
+   * {@link describeModelRouteGap} so it can be tested without a host.
+   */
+  const routeGapFor = (provider: string, model: string): string | undefined => {
+    const catalog = catalogForProvider(provider)
+    if (catalog === undefined) return undefined
+    const gap = modelRouteGap(catalog, model)
+    if (gap === undefined) return undefined
+    const lane = provider === POOL_PROVIDER_BY_REGION.global ? 'the international lane' : 'the domestic lane'
+    return describeModelRouteGap(gap, model, lane)
+  }
   ctx.inject(['webServer'], (webCtx) => registerPoolStatusRoute(webCtx, {
     pool: core.pool,
     catalogs: core.catalogs,
@@ -1414,11 +1443,21 @@ function canonicalJson(value: unknown): string {
      * about. Asking our own shims instead would make the button report on the
      * plumbing rather than on the model the user clicked.
      *
+     * A model the provider does not SERVE is diagnosed before the call. The card
+     * lists the whole catalog while the provider serves only the enabled subset,
+     * so testing a switched-off row used to reach the host and come back as
+     * `pi-ai provider "xdpool-global" has no configured model
+     * "deepseek-v4.1-flash-sg"` — a failure that names no cause, points at the
+     * model rather than at the switch, and reads as "this gateway does not have
+     * that model" when the gateway is serving it fine. See {@link routeGapFor}.
+     *
      * Never throws (see {@link probeModelConnectivity}): the measurement is the
      * answer, and a rejection here would show as a bare route failure that reads
      * like a wrong key.
      */
     probeModel: async (provider: string, model: string, signal?: AbortSignal): Promise<PoolWebModelProbeResult> => {
+      const gap = routeGapFor(provider, model)
+      if (gap !== undefined) return { ok: false, outputChars: 0, error: gap }
       // The host types `ctx.llm` itself; the cast is to this module's minimal
       // structural slice rather than to `any`, so a change in the host's stream
       // signature that breaks the fields we actually read is still caught here.

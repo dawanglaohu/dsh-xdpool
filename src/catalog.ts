@@ -111,14 +111,51 @@ export type CatalogRegion = 'cn' | 'global'
  * context window were captured from `www.workbuddy.ai`, so inventing
  * `maxOutputTokens` / `supportsImages` for 25 rows would put fabricated fields in
  * front of the user — strictly worse than the shared list it replaces.
+ *
+ * The one exception is appended below and only there, because it is the one row
+ * with no domestic twin to share: the domestic gateway does not sell it at all.
  */
-const FALLBACK_WORKBUDDY_MODELS_GLOBAL: readonly WorkBuddyModelInfo[] = FALLBACK_WORKBUDDY_MODELS.map(
-  model => {
-    const tags = (model.tags ?? []).filter(tag => !tag.startsWith(BADGE_TAG_PREFIX))
-    if (tags.length === (model.tags?.length ?? 0)) return model
-    return { ...model, ...(tags.length === 0 ? {} : { tags }) }
+const FALLBACK_WORKBUDDY_MODELS_GLOBAL: readonly WorkBuddyModelInfo[] = [
+  ...FALLBACK_WORKBUDDY_MODELS.map(
+    model => {
+      const tags = (model.tags ?? []).filter(tag => !tag.startsWith(BADGE_TAG_PREFIX))
+      if (tags.length === (model.tags?.length ?? 0)) return model
+      return { ...model, ...(tags.length === 0 ? {} : { tags }) }
+    },
+  ),
+  /**
+   * The one international row with no domestic twin.
+   *
+   * `deepseek-v4.1-flash-sg` is the Singapore-priced DeepSeek-V4.1-Flash: the
+   * same model the CN roster sells as `deepseek-v4.1-flash`, on a separate
+   * rate-limit row at `x0.03` instead of `x0.11`. It is captured from
+   * `www.workbuddy.ai/v3/config` verbatim — window `1_000_000` (the gateway
+   * publishes `defaultLength: 300000` plus `supportedLengths: [300000,
+   * 1000000]`, and {@link resolveContextWindow} in `upstream.ts` takes the
+   * largest), output `128_000`, images yes, efforts `low / high / max`.
+   *
+   * It has to live in the static table, not only in the live merge. A failed
+   * startup fetch falls back to this list, and a user who had the row enabled
+   * then loses it from the picker AND from the provider's roster — a session
+   * pinned to the id dies with `pi-ai provider "xdpool-global" has no configured
+   * model "deepseek-v4.1-flash-sg"`, which reads as "the plugin does not have
+   * this model" when the gateway is in fact serving it.
+   *
+   * Appended rather than merged into the shared table above: that one is the CN
+   * roster and is kept in step with `copilot.tencent.com`, which does not
+   * advertise this id. A CN fallback naming it would offer a model the domestic
+   * gateway answers `11102 service info not found` for.
+   */
+  {
+    id: 'deepseek-v4.1-flash-sg',
+    name: 'Deepseek-V4.1-Flash',
+    contextWindow: 1_000_000,
+    maxOutputTokens: 128_000,
+    supportsImages: true,
+    multiplier: 0.03,
+    supportedEfforts: ['low', 'high', 'max'],
   },
-)
+]
 
 /**
  * Rows the international gateway was measured refusing, so the live merge must
@@ -300,6 +337,55 @@ export interface ModelSelection {
   imageModelIds?: readonly string[]
   /** Per-model context-window cap, keyed by model id. */
   contextBudgets?: Readonly<Record<string, number | undefined>>
+}
+
+/**
+ * Why a model the card lists is missing from the provider's own roster.
+ *
+ * The card renders {@link WorkBuddyCatalog.current} — the whole catalog — while
+ * the pi-ai provider serves {@link WorkBuddyCatalog.visible}, which applies the
+ * user's selection. Those two lists are supposed to differ; what must not differ
+ * is the EXPLANATION the user gets for it.
+ *
+ * A disabled row is not a broken model, but a request for one dies inside the
+ * host with `pi-ai provider "xdpool-global" has no configured model
+ * "deepseek-v4.1-flash-sg"` — a message that names no cause and reads as "this
+ * plugin never had that model". The connection test on that same row therefore
+ * reported a failure for a model the gateway serves happily. Returning the gap
+ * lets the probe say which of the two it is.
+ *
+ * `not-in-catalog` covers the other half: an id that arrived from a session, a
+ * hand-edited config, or a stale tab and that no roster knows about at all.
+ */
+export type ModelRouteGap = 'not-in-catalog' | 'disabled-by-selection'
+
+/** Classify `id` against a catalog's full roster and its visible subset. */
+export function modelRouteGap(catalog: WorkBuddyCatalog, id: string): ModelRouteGap | undefined {
+  if (!catalog.current().some(model => model.id === id)) return 'not-in-catalog'
+  if (catalog.visible().some(model => model.id === id)) return undefined
+  return 'disabled-by-selection'
+}
+
+/**
+ * The sentence a user reads when {@link modelRouteGap} has an answer.
+ *
+ * English, like every other diagnostic this plugin puts on the wire
+ * (`shim.ts`'s upstream messages, the shim's `writeOpenAIError`): the card
+ * renders a probe failure verbatim, and one language per error surface is what
+ * keeps it readable next to those.
+ *
+ * Both halves name the FIX rather than the symptom. The card's model list is
+ * where the switch lives, and "Refresh models" is the button that re-fetches a
+ * roster — so the message says which of the two to press, instead of restating
+ * that the model could not be resolved.
+ */
+export function describeModelRouteGap(gap: ModelRouteGap, model: string, lane: string): string {
+  if (gap === 'disabled-by-selection') {
+    return `${model} is switched OFF in ${lane}'s model list, so XD Pool does not register it as a `
+      + 'routable model. Tick it in the XD Pool card\'s model list, save, and retry.'
+  }
+  return `${model} is not in ${lane}'s model catalog. It may come from an old session, a hand-edited `
+    + 'config, or a row the gateway has withdrawn. Press "Refresh models" on the XD Pool card and retry.'
 }
 
 /** Convert one upstream catalog entry into the plugin's model-info shape. */

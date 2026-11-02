@@ -1,6 +1,21 @@
 # Changelog
 本项目的所有重要变更都会记录在此文件。
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
+## 2.5.3 — 国际版的 `deepseek-v4.1-flash-sg` 不在兜底表里，且「被关掉」被报成「没有这个模型」
+> 现象是「在 XD Pool 卡片里测 `deepseek-v4.1-flash-sg`，回 `pi-ai provider "xdpool-global" has no configured model "deepseek-v4.1-flash-sg"`」。但国际版里这个模型是好的：`www.workbuddy.ai/v3/config` 用插件的 `DESKTOP_UA`（`WorkBuddy/5.5.2`）请求回来 HTTP 200、24 条 `data.models`，`agents` 里 `name === 'cli'` 的白名单 22 个 id 里就有它；它的原始条目 `{ contextWindow:{defaultLength:300000,supportedLengths:[300000,1000000]}, credits:"x0.03", maxOutputTokens:128000, reasoning:{supportedEfforts:["low","high","max"]}, supportsImages:true, … }` 过 `parseUpstreamModel` 也不会被丢。
+
+### 真正的原因：卡片列的是整个目录，provider 只注册「已启用」的子集
+`web-status.ts` 的画卡走 `catalogs[region].current()`（全量，33 行），而 `adapter.ts` 的 `buildModels()` 走 `catalog.visible()` —— 后者按用户保存的 `enabledModelIds` 白名单过滤。本机 `~/.dsh/profiles/desktop/cordis.patch.yml` 里 `modelSelectionGlobal.enabledModelIds` 是 6 个 id，**不含 `-sg`**，于是 `visible()` 里没有它、provider 不注册它、宿主 `modelOf` 拿到 `undefined` 就抛了那句 `has no configured model`。实测三连：`deepseek-v4.1-flash`（在白名单里）→ `ok:true`；`-sg`、`gpt-6-astra`、`grok-4.7`、`kimi-k3`（都不在白名单里）→ 同一条报错。把 `-sg` 加进白名单再测 → `{"ok":true,"outputChars":5}`。
+
+这条报错指向模型，不指向开关，而卡片正好把这一行画成可点的「测试连接」，所以它读起来永远是「这个网关没有这个模型」。
+
+### 三处修改
+1. **`src/catalog.ts` 的 `FALLBACK_WORKBUDDY_MODELS_GLOBAL` 补上 `-sg` 行**（`1_000_000` / `128_000` / `multiplier: 0.03` / `efforts: low,high,max` / `supportsImages`）。以前它只存在于 live 合并里，启动抓取一失败，兜底表就没有这一行 —— 用户明明启用过它，重启后既不在选择器里也不在 provider 名册里。**只加在国际版表**：CN 网关对这个 id 回 `11102 service info not found`，放进共享表等于在那边摆一行注定失败的模型。`tests/badges.test.ts` 原来断言「两区 id 完全相同」，改成「国际版必须是 CN 的超集，且多出来的恰好只有 `-sg`」。
+2. **`src/catalog.ts` 新增 `modelRouteGap()`**，把「目录里有但没注册」与「目录里根本没有」分成两种事实，`probeModel`（`src/index.ts`）在调宿主之前先判一次，分别给出可执行的说明：前者说「在卡片里勾选并保存」，后者说「按『重新获取模型』」。**判定只对 pool 两条车道生效**：聚合车道和免费车道有自己的名册，那里不猜。
+3. 新文件 `tests/global-model-route-gap.test.ts`（11 条）钉住三件事：兜底表里 `-sg` 的字段与 live 一致、live 合并后不重复、以及两种 gap 的分流（含「选择为空 = 全开」与「兜底态也能诊断」）。
+
+端到端：改后 `model/test` 对 `-sg` 返回 `{"ok":true,"outputChars":5,"firstFrameMs":1283}`；`tsc` 与 1128 条测试全绿。
+
 ## 2.5.2 — 400 落在哪个码上就报哪个原因：11128 有三个触发器，11133 是另一回事
 > 现象是「用国内版账号聊天，回 `workbuddy upstream client (http 400) after 1 account(s) [🍀眠#…]: {"code":11128,"msg":"Illegal API invocation from an unapproved channel"}`」，之后在另一条会话里变成 `{"code":11133,"msg":"Invalid request parameters"}`。2.3.0 把 11128 归因成「缺三个会话标识头」，理由是当时的 `displayTips` 说「这次调用没通过渠道校验，可能不是官方客户端发出的」。**那条提示是误导**。
 >
