@@ -21,6 +21,7 @@ import type { WorkBuddyCatalog, WorkBuddyModelInfo } from './catalog.ts'
 import { isEffortRejection, parseRateLimitReset, withoutReasoningEffort, WorkBuddyUpstreamClient, type ChatStreamResult, type UpstreamErrorKind, type WorkBuddyRegion } from './upstream.ts'
 import { compactWithSummary, estimateMessagesTokens, hardTruncate, repairToolPairing, type ChatMessage } from './context-budget.ts'
 import { AggregateError, forwardAggregateStreamed, resolveAggregateProvider, type AggregateCatalog } from './aggregate.ts'
+import { finishTokenInFrame, hostFinishFrame, isHostFinishToken } from './finish-token.ts'
 import { parseProviderModelId } from './providers.ts'
 import { recordRejectedBody } from './rejected-body.ts'
 import {
@@ -1453,6 +1454,20 @@ interface UsageContext {
   turnId: string
 }
 /**
+ * True when one forwarded frame carries part of the answer.
+ *
+ * It only decides whether an upstream abort is reported as "before sending any
+ * text" or as "the answer was cut short", so it never touches the bytes that are
+ * forwarded. Written on the raw JSON rather than on a parsed delta because it runs
+ * on every frame of every turn: `"content":""` — the role-only first frame every
+ * turn opens with — does not count, while a delta with `tool_calls` does, since a
+ * callable turn is an answer the user can act on.
+ */
+function carriesAnswerDelta(frame: string): boolean {
+  if (frame.includes('"tool_calls"')) return true
+  return /"(?:content|reasoning_content|reasoning)"\s*:\s*"(?:[^"\\]|\\.)+/u.test(frame)
+}
+/**
  * Serve one already-successful upstream stream as an SSE response.
  *
  * Extracted so the context-overrun recovery path reuses the exact same
@@ -1462,6 +1477,11 @@ interface UsageContext {
  * built from those numbers, so asking for them and then dropping the frames the
  * host did not ask for costs one filter and keeps the forwarded stream
  * byte-identical to what the host would have received without it.
+ *
+ * The response headers are deliberately NOT written up front: they go out with the
+ * first frame of the answer. That is what leaves room to refuse a turn whose
+ * upstream dies before answering, instead of committing to a `200` that then
+ * resolves to nothing.
  */
 async function serveSuccessfulStream(
   res: ServerResponse,
@@ -1480,12 +1500,6 @@ async function serveSuccessfulStream(
   // fresh reading. Deliberately NOT awaited: the response is already ready and
   // a balance lookup must never delay the user's stream.
   void refreshBalance(account)
-  res.writeHead(200, {
-    'Content-Type': 'text/event-stream',
-    'Cache-Control': 'no-cache',
-    'Connection': 'keep-alive',
-    'X-Accel-Buffering': 'no',
-  })
   const tracker = new StreamTracker(Date.now())
   let recorded = false
   /**
@@ -1514,13 +1528,59 @@ async function serveSuccessfulStream(
     })
   }
   let sawDone = false
+  /**
+   * The answer has reached the user, so the response is committed.
+   *
+   * Deliberately NOT the same as "the upstream sent something": the first frame of
+   * a WorkBuddy turn is `{"delta":{"role":"assistant","content":""}}`, and an
+   * upstream that dies right after it has delivered nothing. Committing on that
+   * frame would turn a dead turn into an empty answer.
+   */
+  let answerSeen = false
+  /** The SSE headers are on the wire; the outcome can no longer be a status code. */
+  let streaming = false
+  /** The response is over, by an error body or by the end of the answer. */
+  let settled = false
+  /** The upstream ended with a token the host cannot decode (see `finish-token`). */
+  let abnormalFinish = false
+  const startStream = (): void => {
+    if (streaming || settled) return
+    streaming = true
+    res.writeHead(200, {
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache',
+      'Connection': 'keep-alive',
+      'X-Accel-Buffering': 'no',
+    })
+  }
+  /**
+   * Answer the turn with an error while nothing has been written yet.
+   *
+   * The headers are held back until the first frame is forwarded precisely so an
+   * upstream that dies before answering can still be reported as a failure. A turn
+   * that reached the host as `200` and then resolved to no text is not neutral
+   * either way: the host reads it as an empty answer or, when the upstream ends it
+   * with `finish_reason: "error"`, as a thrown `Provider finish_reason: error` that
+   * kills the user's run.
+   */
+  const failBeforeAnswer = (message: string): void => {
+    if (settled) return
+    settled = true
+    finish(false)
+    writeOpenAIError(res, 502, 'upstream_failed', message)
+  }
+  /** Cut the upstream loose once the turn it was serving can no longer matter. */
+  let abortUpstream = (): void => {}
   // Forwarded BYTE FOR BYTE: a frame is sliced by offset and the original buffer
   // is pushed, never decoded and re-encoded. Decoding here would risk a U+FFFD at
   // a split boundary, and one replacement character in the middle of an answer is
-  // a bug the user reads but the logs cannot explain.
+  // a bug the user reads but the logs cannot explain. The single exception is a
+  // finish token the host would throw on: that one token is rewritten, and the rest
+  // of that frame stays exactly as the upstream wrote it.
   let pending = Buffer.alloc(0)
   const strip = new Transform({
     transform(this: Transform, chunk: Buffer, _encoding: BufferEncoding, done: (error?: Error | null) => void): void {
+      if (settled) return done()
       // Idempotent: the tracker keeps the earliest byte, so calling it per chunk
       // costs nothing beyond one Date.now() and cannot skew the measurement.
       tracker.markFirstByte(Date.now())
@@ -1530,40 +1590,92 @@ async function serveSuccessfulStream(
         const span = frameSpan(pending)
         if (span === undefined) break
         const frame = pending.subarray(0, span.contentEnd).toString('utf8')
+        // Feed usage from EVERY frame that carries it, not only from the
+        // trailer: a gateway that reports usage on its last content chunk
+        // instead of a separate trailer frame would otherwise look like it
+        // reported nothing at all. Observing never decides deletion - only
+        // `usageOnly` does, and a content frame is never dropped.
         const seen = inspectSseFrame(frame)
-        if (seen === undefined) {
+        if (seen !== undefined) tracker.observe(seen.parsed)
+        // Read before the token branch: one frame can carry both the last words
+        // and the terminal token, and that answer is already the whole answer.
+        const answered = carriesAnswerDelta(frame)
+        const token = finishTokenInFrame(frame)
+        if (token !== undefined && !isHostFinishToken(token)) {
+          if (!answerSeen && !answered) {
+            // Nothing reached the caller yet, so the honest answer is the failure
+            // itself instead of a 200 that resolves to no text.
+            logger?.warn(
+              `dsh-xdpool: ${account.label} ended the turn with finish_reason "${token}" `
+                + 'before sending any text; reporting it as a failed upstream call',
+            )
+            abortUpstream()
+            failBeforeAnswer(
+              `the upstream ended the turn with finish_reason "${token}" before sending any text `
+                + `(${account.label}); it aborted the generation instead of answering`,
+            )
+            pending = Buffer.alloc(0)
+            return done()
+          }
+          // An answer is already on the wire, and dropping the turn now would throw
+          // away everything the user can already read. `stop` is the only terminal
+          // token the host decodes as a finished turn, so the answer stands and the
+          // abort is reported in the log instead.
+          abnormalFinish = true
+          logger?.warn(
+            `dsh-xdpool: ${account.label} ended the turn with finish_reason "${token}" `
+              + 'after the answer started; forwarding it as "stop" so the host keeps the answer',
+          )
+          if (seen?.usageOnly !== true) {
+            keep.push(Buffer.from(
+              `${hostFinishFrame(frame)}${pending.subarray(span.contentEnd, span.frameEnd).toString('utf8')}`,
+              'utf8',
+            ))
+          }
+        } else if (seen === undefined || !seen.usageOnly) {
           keep.push(pending.subarray(0, span.frameEnd))
-        } else {
-          // Feed usage from EVERY frame that carries it, not only from the
-          // trailer: a gateway that reports usage on its last content chunk
-          // instead of a separate trailer frame would otherwise look like it
-          // reported nothing at all. Observing never decides deletion - only
-          // `usageOnly` does, and a content frame is never dropped.
-          tracker.observe(seen.parsed)
-          if (!seen.usageOnly) keep.push(pending.subarray(0, span.frameEnd))
         }
+        if (answered) answerSeen = true
         pending = pending.subarray(span.frameEnd)
       }
       if (keep.length === 0) return done()
+      startStream()
       this.push(keep.length === 1 ? keep[0] : Buffer.concat(keep))
       done()
     },
     flush(done: (error?: Error | null) => void): void {
+      if (settled) return done()
       // A trailing fragment with no blank line is still the user's text, and the
       // host reads end-of-stream as the end of the answer. Dropping it would
       // silently truncate the last words of every reply.
       if (pending.length > 0) this.push(pending)
+      // An answer with no frames at all is still an SSE response that ends, not a
+      // bare 200: the headers are written here when nothing was forwarded.
+      startStream()
       tracker.finish(Date.now())
-      finish(sawDone)
+      // A rewritten finish token means the upstream cut the turn short. The answer
+      // is delivered, but the call itself did not finish, and the panel is the only
+      // place that says so.
+      finish(sawDone && !abnormalFinish)
       done()
     },
   })
   const body = Readable.fromWeb(result.response.body as Parameters<typeof Readable.fromWeb>[0])
+  abortUpstream = (): void => {
+    body.destroy()
+  }
   body.on('data', (chunk: Buffer) => {
     if (chunk.includes('[DONE]')) sawDone = true
   })
   body.on('error', (error: unknown) => {
     logger?.warn('dsh-xdpool: upstream stream failed mid-flight', error)
+    if (!streaming) {
+      failBeforeAnswer(
+        `the upstream stream failed before any text was sent (${account.label}): `
+          + `${error instanceof Error ? error.message : String(error)}`,
+      )
+      return
+    }
     finish(false)
     if (!sawDone && res.writable) res.end('data: [DONE]\n\n')
   })

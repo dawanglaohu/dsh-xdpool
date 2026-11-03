@@ -1,6 +1,35 @@
 # Changelog
 本项目的所有重要变更都会记录在此文件。
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
+## 2.5.5 — 跑到一半被 `Provider finish_reason: error` 打断：上游的「generation died」被原样转给了宿主
+> 现象是「xdpool 在运行时老是被中断，提示 `本轮运行失败 Provider finish_reason: error`」。同一句话在 `~/.dsh/.xdpool/startup.log` 里查不到，会话日志里也查不到 —— 因为它不是本插件写的报文，也不是一次 HTTP 失败。
+
+### 根因：`finish_reason: "error"` 是一个「正常结束但失败」的回合，宿主只能抛
+报文出自 pi-ai，不是本插件：`pi-ai/dist/api/openai-completions.js` 的 `mapStopReason(reason)` 只认 `stop|end`（→ `stop`）、`length`、`function_call|tool_calls`（→ `toolUse`）；`content_filter` / `network_error` 各自映射成一条 error，**其余任何 token 落进 `default:`**，返回 `{ stopReason: 'error', errorMessage: `Provider finish_reason: ${reason}` }`；流读完时它看到 `stopReason === 'error'` 就 `throw new Error(errorMessage)`。
+
+于是「上游用它自己的话说完这次生成死了」变成了宿主眼里的「一个成功结束、但结论是失败的回答」。这条路径上没有状态码可判、没有 failover 可走、没有重试可触发，**已经生成的内容一起丢掉** —— 所以用户看到的是「被中断」，而不是「换了个账号」。
+
+对上游来说 `finish_reason: 'error'` 是常见写法（OpenAI 兼容网关用它表示生成中断），而本插件当时在四个出口都把它当普通 token 原样转了出去：
+
+1. 免费车道：`postFreeStreamed` 把上游 `finish_reason` 直接写进 `result.finishReason`，`free-lane` 再把它写进终结帧。
+2. 聚合车道（SSE）：`forwardAggregateStreamed` 把已经缓冲好的 payload 原样 `onData`，一个 token 都不看。
+3. 聚合车道（JSON 回答）：`chatFrames` 只判空不判值，`'error'` 原样进 `finish_reason`。
+4. 账号池车道：`serveSuccessfulStream` 的 Transform 只过滤 usage-only 帧，其余字节**逐字节转发**，包括这个 token。
+
+### 四处修改 + 一个新模块
+新增 `src/finish-token.ts`，把规则写在一处：宿主认识的 token 原样透传（`length` 不能被吞掉，那是「被输出上限截断」的唯一信号），其余一律翻成 `stop`。同时提供帧级读/改：`finishTokenInFrame`（先看有没有 `finish_reason` 字样，再解析；裸 payload 与 `data:` 帧都认）和 `hostFinishFrame`（只替换那一个 token，其余字节不动 —— 池车道承诺「转发上游写的东西」，一个 `JSON.stringify` 就毁了这条承诺）。
+
+1. **免费车道先失败再重试**。`postFreeStreamed` 见到不认识的 token 就抛 `AggregateError('server', …, 200)`：这条车道整轮缓冲，一条半截答案不会被交出去，所以「这次尝试失败」是准确的判断。`free-lane` 只在 `kind === 'server' && status === 200`（被接受后中途死掉）时重试一次，间隔 600 ms；拒绝、断连、超时（status 0）不重试 —— 再问一遍只会把用户的等待翻倍。每轮的帧按尝试各持一份，重试成功时只 flush 第二次的帧，所以不会出现「半截答案 + 正确答案」拼在一起，一次用户请求仍只记一条用量。
+2. **聚合车道的 SSE 也不再转发异常 token**。`forwardAggregateStreamed` 在 `onData` 之前扫一遍已缓冲的 payload，命中就抛同一种 `AggregateError`；`serveAggregateCompletion` 的回退把它变成 `502 aggregate_server` 并指名 token。JSON 回答（整段一次性给完、没有「中途」可中断）走 `chatFrames` 的翻译，答案照常交付。
+3. **账号池车道：答案已发出就保住它，没发出就报错**。这是唯一一条边读边转发的车道，能做的只有两件事，靠新增的 `carriesAnswerDelta`（角色帧 `"content":""` 不算答案，`tool_calls` 算）区分：文本已经在转发 → 把终结 token 改成 `stop`，答案留给用户，`warn` 里写明「upstream 在答案开始后用 `finish_reason: "error"` 结束，已按 `stop` 转发」，同时这一轮在面板里记为未完成（它确实没跑完）；还没转发任何文本 → **放弃这个 200**，回 `502 upstream_failed` 并指出 token 与账号标签。后者成立的前提是把 SSE 头推迟到「第一帧要写出去」的那一刻（原来 `serveSuccessfulStream` 一进来就 `writeHead(200)`）：头没发，就还来得及用一个状态码说清事实；头一发，就只能二选一 —— 空回答，或者这条 bug。
+4. `serveSuccessfulStream` 的 body 错误分支也跟着分了流：没开始流转发时同样走 `failBeforeAnswer`，只有已经开始转发了才用原来的「补一个 `[DONE]`」收尾。
+
+### 测试
+新增两个文件，共 18 条：`tests/finish-token.test.ts`（12 条）钉住 token 表、`stop` 兜底、裸 payload 与 `data:` 帧两种形状、`null`/缺字段/多 choice、非 JSON 帧的兜底读取、只改 token 不改其余字节，以及「模型在正文里讨论 `finish_reason`」不会被改坏（内容里的引号是转义过的）；`tests/finish-reason-stream.test.ts`（6 条）逐条车道钉住行为 —— 免费车道重试一次且只交第二轮的答案、两次都死就以 `AggregateError` 收尾且 `onFrame` 一次都没被调用；聚合车道 `502 aggregate_server`、JSON 回答照常交付；池车道「有答案 → 200 + `stop` + 日志」、「没答案 → 502 + 指名 token」。全量 92 文件 / 1155 条通过，`tsc` 干净。
+
+### 生效方式
+`lib/` 是随仓库提交的构建产物，本次已重新构建；DSH 需要重启（或重装插件）才会加载新的 `lib/index.js`。
+
 ## 2.5.3 — 国际版的 `deepseek-v4.1-flash-sg` 不在兜底表里，且「被关掉」被报成「没有这个模型」
 > 现象是「在 XD Pool 卡片里测 `deepseek-v4.1-flash-sg`，回 `pi-ai provider "xdpool-global" has no configured model "deepseek-v4.1-flash-sg"`」。但国际版里这个模型是好的：`www.workbuddy.ai/v3/config` 用插件的 `DESKTOP_UA`（`WorkBuddy/5.5.2`）请求回来 HTTP 200、24 条 `data.models`，`agents` 里 `name === 'cli'` 的白名单 22 个 id 里就有它；它的原始条目 `{ contextWindow:{defaultLength:300000,supportedLengths:[300000,1000000]}, credits:"x0.03", maxOutputTokens:128000, reasoning:{supportedEfforts:["low","high","max"]}, supportsImages:true, … }` 过 `parseUpstreamModel` 也不会被丢。
 

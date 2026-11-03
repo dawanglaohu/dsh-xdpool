@@ -58,6 +58,7 @@ import {
   type FreeEvent,
   type FreeWire,
 } from './free-messages.ts'
+import { hostFinishToken, isHostFinishToken } from './finish-token.ts'
 
 export type { FingerprintPlan }
 
@@ -848,13 +849,28 @@ export async function postFreeStreamed(
   // cannot run — is how a truncated turn comes back demanding a retry forever.
   if (tools.calls() > 0) finish = 'tool_calls'
   else if (finish === 'tool_calls') finish = result.truncated === true ? 'length' : 'stop'
+  // An invented token means the gateway killed the generation, not that the turn
+  // finished: `finish_reason: "error"` is how an OpenAI-compatible upstream says
+  // "this stream died". Passing it on hands the host a token it maps to a thrown
+  // `Provider finish_reason: error`, which ends the user's run over an answer the
+  // lane could have retried. Everything this function decoded so far is still only
+  // in `hooks`' hands, and the lane buffers before it forwards (see `free-lane`),
+  // so the whole attempt can be refused here and asked again.
+  if (finish !== undefined && !isHostFinishToken(finish)) {
+    throw new AggregateError(
+      'server',
+      `the free upstream ended the turn with finish_reason "${finish}" instead of an answer; `
+        + 'it aborted the generation mid-stream',
+      response.status,
+    )
+  }
   if (finish === 'length') result.truncated = true
   if (usage !== undefined) {
     hooks.onDelta({ usage })
     result.usage = usage
   }
   result.suppressedOnly = tools.suppressed()
-  result.finishReason = finish
+  result.finishReason = hostFinishToken(finish)
   return result
 }
 

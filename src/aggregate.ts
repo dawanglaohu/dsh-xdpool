@@ -41,6 +41,7 @@ import {
   type ProviderSetting,
 } from './providers.ts'
 import { combosOf, providerAuthUsable, providerEnabled, type AggregateStore } from './store.ts'
+import { finishTokenInFrame, hostFinishToken, isHostFinishToken } from './finish-token.ts'
 import {
   buildComboCatalog,
   pruneRotation,
@@ -776,7 +777,26 @@ export async function forwardAggregateStreamed(
     if (head.shape === 'empty') throw new AggregateError('server', 'the provider returned no body', response.status)
     if (head.shape === 'sse') {
       // Raw payloads, straight through: the wire's own decoder reads them, so
-      // nothing is rewritten between the provider and the host.
+      // nothing is rewritten between the provider and the host — except a finish
+      // token the host would decode as a thrown failure. A provider that ends a
+      // stream with `finish_reason: "error"` is reporting a generation it killed,
+      // and forwarding that token costs the user the entire turn (see
+      // `finish-token`). The whole head is already buffered by `readSseHead`, so
+      // the attempt can still be refused cleanly and the caller's chain can move
+      // to the next member.
+      const aborted = head.payloads.find(payload => {
+        const token = finishTokenInFrame(payload)
+        return token !== undefined && !isHostFinishToken(token)
+      })
+      if (aborted !== undefined) {
+        const token = finishTokenInFrame(aborted) ?? ''
+        throw new AggregateError(
+          'server',
+          `${resolved.providerName} ended the stream with finish_reason "${token}" instead of an answer; `
+            + 'it aborted the generation mid-stream',
+          response.status,
+        )
+      }
       for (const payload of head.payloads) options.onData(payload)
       return { status: response.status }
     }
@@ -1009,7 +1029,7 @@ function chatFrames(payload: unknown, model: string): string[] {
   }
   frames.push(JSON.stringify({
     ...head,
-    choices: [{ index: 0, delta: {}, finish_reason: text(choice.finish_reason) === '' ? 'stop' : text(choice.finish_reason) }],
+    choices: [{ index: 0, delta: {}, finish_reason: hostFinishToken(text(choice.finish_reason)) }],
     ...root.usage === undefined ? {} : { usage: root.usage },
   }))
   return frames
