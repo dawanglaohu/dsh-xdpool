@@ -70,7 +70,16 @@ export interface PackCredentialDocument {
 
 /** The slice of the pack's pool this module reads. Duck-typed on purpose. */
 export interface PackAccountReader {
-  listAllAccounts(): readonly PackAccountEntry[]
+  /**
+   * Every account the pack holds, for all thirteen channels.
+   *
+   * The vendored pack declares this `async` (`vendor/channel-pack/pack.js`,
+   * `async listAllAccounts()`), so the reading is a promise — a caller that
+   * treats it as an array gets `TypeError: ….filter is not a function` and
+   * silently loses every scan sign-in. The union keeps this honest for a future
+   * pack revision that publishes the list synchronously.
+   */
+  listAllAccounts(): readonly PackAccountEntry[] | Promise<readonly PackAccountEntry[]>
   resolveCredentialByRef(refName: string): Promise<unknown> | unknown
 }
 
@@ -161,7 +170,12 @@ export function readPackAccountPool(ctx: unknown): PackAccountReader | undefined
  */
 export async function readPackCredentials(pool: PackAccountReader | undefined): Promise<WorkBuddyCredential[]> {
   if (pool === undefined) return []
-  const entries = pool.listAllAccounts().filter(entry => {
+  // Awaited because the pack's own reader is async; `Array.isArray` because a
+  // pack revision that answers with something else must cost the channel
+  // accounts, not throw out of `scan()` and take the desktop ones with it.
+  const listed = await pool.listAllAccounts()
+  if (!Array.isArray(listed)) return []
+  const entries = listed.filter(entry => {
     const provider = text(entry.provider)
     return provider !== undefined && PACK_REGION_CHANNELS.includes(provider)
   })
@@ -208,8 +222,45 @@ export async function adoptChannelPackAccounts(
     const merged = await pool.scan()
     const count = Array.isArray(merged) ? merged.length : 0
     logger?.info?.(`[xdpool] pool now serves ${count} account(s) including channel sign-ins`)
+    // A bridge that reads nothing is indistinguishable from a pack that holds
+    // nothing, and the difference matters: the first is a bug on this side, the
+    // second is a user who has simply not signed in yet. Only the total failure
+    // is reported — a partial dropout is usually an account the user ignored on
+    // purpose, and warning about those would train the reader to skip the line.
+    const adopted = Array.isArray(merged)
+      ? merged.filter((account) => {
+        const source = (account as { credential?: { sourcePath?: unknown } }).credential?.sourcePath
+        return typeof source === 'string' && source.startsWith('channel-pack:')
+      }).length
+      : 0
+    if (adopted === 0) {
+      const listed = await countRegionRows(pack)
+      if (listed > 0) {
+        logger?.warn?.(
+          `[xdpool] the channel pack lists ${listed} WorkBuddy/CodeBuddy account(s) but none reached the pool; `
+          + 'those sign-ins stay invisible on the region cards',
+        )
+      }
+    }
   } catch (error: unknown) {
     logger?.warn?.('[xdpool] could not merge channel-pack accounts', error)
+  }
+}
+
+/**
+ * How many pool-owned rows the pack lists, as a diagnostic count.
+ *
+ * Swallows its own failure on purpose: this number only decides whether a
+ * warning is worth printing, and a pack that cannot answer has already been
+ * reported by the reading path.
+ */
+async function countRegionRows(pack: PackAccountReader): Promise<number> {
+  try {
+    const listed = await pack.listAllAccounts()
+    if (!Array.isArray(listed)) return 0
+    return listed.filter(entry => PACK_REGION_CHANNELS.includes(text(entry.provider) ?? '')).length
+  } catch {
+    return 0
   }
 }
 

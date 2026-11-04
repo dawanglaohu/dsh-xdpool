@@ -151,6 +151,27 @@ describe('reading the pack pool', () => {
     await expect(readPackCredentials(undefined)).resolves.toEqual([])
   })
 
+  it('awaits a pool whose listAllAccounts is async, as the vendored pack declares it', async () => {
+    // `vendor/channel-pack/pack.js:30374` is `async listAllAccounts()`, so the
+    // reading is a promise. Every other test here mocks it synchronously, which
+    // is exactly how the missing await survived: the sync mock and the real
+    // async pool both type-check, but only one of them hands back an array.
+    const reader = {
+      listAllAccounts: async () => [entry({ provider: 'buddy' })],
+      resolveCredentialByRef: async (ref: string) =>
+        ref === 'BUDDY_ACCOUNT_ABCD1234' ? JSON.parse(document()) : undefined,
+    }
+    await expect(readPackCredentials(reader)).resolves.toHaveLength(1)
+  })
+
+  it('treats a pool that lists nothing usable as no accounts, not a crash', async () => {
+    const reader = {
+      listAllAccounts: async () => [],
+      resolveCredentialByRef: async () => undefined,
+    }
+    await expect(readPackCredentials(reader)).resolves.toEqual([])
+  })
+
   it('refuses a service that does not look like the pack pool', () => {
     expect(readPackAccountPool(ctxWith({ listAllAccounts: () => [] }))).toBeUndefined()
     expect(readPackAccountPool(ctxWith(undefined))).toBeUndefined()

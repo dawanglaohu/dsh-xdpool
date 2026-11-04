@@ -1,6 +1,32 @@
 # Changelog
 本项目的所有重要变更都会记录在此文件。
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
+## 2.5.6 — 扫码登录的账号从来进不了池：pack 的 `listAllAccounts` 是 `async`，桥接当同步数组用了
+> 现象是「刚扫码加了一个国内版账号，账号池里没有，点『重新检测账号』也没反应」。凭据其实已经稳稳写进 channel-pack 了 —— `~/.dsh/settings-legacy.yaml` 里有 `buddy-c758b0ad`，`~/.dsh/.credentials.yaml` 里有 `BUDDY_ACCOUNT_1F3F740A`，`domain` / `user_id` / `refresh_token` 一应俱全。它只是永远走不到池子里。
+
+### 根因：`.filter` 作用在 Promise 上
+`src/pack-accounts.ts` 读 pack 的账号列表时写的是
+
+```ts
+const entries = pool.listAllAccounts().filter(entry => { … })
+```
+
+而 vendored pack 声明的是 `async listAllAccounts() { return this.readAccounts(); }`（`vendor/channel-pack/pack.js`）。同步的 `readAccounts()` 被 `async` 包了一层，调用处拿到的是 Promise，于是 `.filter` 抛 `TypeError: pool.listAllAccounts(...).filter is not a function`，`readPackCredentials` 整体失败。
+
+### 为什么这半年没人发现
+- `AccountPool.scan()` 把外部来源包在 `try/catch` 里，失败只写一条 `logger.warn`（`could not read channel-pack accounts; desktop accounts only`）就继续 —— 池子里还剩桌面客户端那几个账号，卡片看起来「基本正常」，只有扫码登录的那批永远缺席。
+- `tests/pack-accounts.test.ts` 的 mock 是 `listAllAccounts: () => entries`，同步的。它能通过类型检查，也能通过 1157 条测试，但它不是 pack 的形状。
+
+### 改动
+1. **`await` 加进桥接**：`PackAccountReader.listAllAccounts()` 的返回类型放宽成 `readonly PackAccountEntry[] | Promise<readonly PackAccountEntry[]>`，`readPackCredentials` 改成 `const listed = await pool.listAllAccounts(); if (!Array.isArray(listed)) return []`。用 `await` 而不是 `Promise.resolve(...)` 是有意的：同步返回的 pool（未来某个版本的 pack）照样能过。
+2. **全丢要说话**：`adoptChannelPackAccounts` 在 scan 之后统计真正进池的 `channel-pack:` 账号数，如果 pack 侧确实列着 buddy/workbuddy 行、而一条都没进来，就 `warn` 一行点明「这些登录在区域卡片上不可见」。只报「全丢」不报「部分丢」：部分丢通常是用户自己忽略过的账号，为它报警会训练人跳过这行。
+3. **两条回归测试**：一条喂 async 的 `listAllAccounts`（复现真实形状），一条喂空列表（确认「没有」不等于「崩」。
+
+### 验证
+`npx vitest run tests/pack-accounts.test.ts` 修复前两条红（`TypeError: pool.listAllAccounts(...).filter is not a function` @ `src/pack-accounts.ts:164`），修复后 15 条绿；全量 `npx vitest run` **92 文件 / 1157 条全绿**，`npx tsc -p tsconfig.json --noEmit` 退出 0。
+
+拿本机真实状态（8 条 pack 账号 + `~/.dsh/.credentials.yaml`）跑修复后的 `readPackCredentials`，返回 5 个凭据，其中就有这次扫码的 `181****9170#f0c54991 / domain=www.workbuddy.cn / source=channel-pack:buddy:BUDDY_ACCOUNT_1F3F740A`，池内 id 为 `75ffa894002eec7a`（`sha256('workbuddy\0f0c54991-29e6-47f4-aa0e-9a38d1988f87')[:16]`），此前池里没有、`ignored.json` 里也没有。另外 4 条里有 2 条是同账号（`衍纸颠封` / `p`）的重复来源，合并按 `compareFreshness` 走，桌面实盘凭据优先，不会把正在用的 token 换掉；`uaoiey07v` 被用户忽略过，继续留在池外。
+
 ## 2.5.5 — 跑到一半被 `Provider finish_reason: error` 打断：上游的「generation died」被原样转给了宿主
 > 现象是「xdpool 在运行时老是被中断，提示 `本轮运行失败 Provider finish_reason: error`」。同一句话在 `~/.dsh/.xdpool/startup.log` 里查不到，会话日志里也查不到 —— 因为它不是本插件写的报文，也不是一次 HTTP 失败。
 
