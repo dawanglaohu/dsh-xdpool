@@ -1,6 +1,24 @@
 # Changelog
 本项目的所有重要变更都会记录在此文件。
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
+## 2.5.7 — 删掉的账号会在下次启动时自己回来：存储播种绕过了忽略名单
+
+### 现象
+把池子里重复的账号删掉（点忽略），卡片上确实空了，但宿主一重启它又出现了 —— 「删除」看起来像只删了一半。
+
+### 根因：进池有三条路，忽略名单只堵了两条
+`scan()` 有三处入口：桌面客户端的 auth 文件、channel-pack 外部来源、以及**持久化存储 `accounts.json` 的播种**（`src/accounts.ts` 里 `if (this.persistent && this.accounts.length === 0)` 那段，只在全新进程、内存为空时执行）。前三者的前两条会在解析前后各查一次 `ignoredIds`，播种那条只查了 `byId.has(entry.id)` —— 也就是说，一个被忽略的 id 只要还留在 `accounts.json` 里，就能在下一个进程启动时重新装回 `byId`。
+
+而忽略本身**不重写** `accounts.json`：`setAccountIgnored` 只写 `ignored.json` 再 `refreshIgnored()`，`scan()` 只在「取消忽略」时才被调用。所以被删的行会一直躺在文件里，等下一个进程把它捡回来。
+
+启动顺序上 `applyIgnored`（`src/index.ts` 里 apply 期同步读忽略文件）早于任何 `scan()`，所以忽略名单在播种时是就位的 —— 缺的不是顺序，是播种段本身少了一次判断。
+
+### 改动
+`src/accounts.ts` 的播种循环里，在 `if (byId.has(entry.id)) continue` 之后补一行 `if (this.ignoredIds.has(entry.id)) continue`。被忽略的 id 不再从存储里复活，`accounts.json` 会在下一次 `scan()` 重写时自然把僵尸行清掉。
+
+### 测试
+`tests/account-store.test.ts` 新增 `does not seed an account the user removed, even though the store still lists it`：临时 `DSH_HOME` 里写两条（一条已忽略、一条保留），`applyIgnored` 后 `scan()`，断言池里只剩保留的那条、且重写后的文件也只剩一条。去掉那行判断时断言失败（`expected [ 'Kept', 'Removed' ] to deeply equal [ 'Kept' ]`），加回后通过。
+
 ## 2.5.6 — 扫码登录的账号从来进不了池：pack 的 `listAllAccounts` 是 `async`，桥接当同步数组用了
 > 现象是「刚扫码加了一个国内版账号，账号池里没有，点『重新检测账号』也没反应」。凭据其实已经稳稳写进 channel-pack 了 —— `~/.dsh/settings-legacy.yaml` 里有 `buddy-c758b0ad`，`~/.dsh/.credentials.yaml` 里有 `BUDDY_ACCOUNT_1F3F740A`，`domain` / `user_id` / `refresh_token` 一应俱全。它只是永远走不到池子里。
 

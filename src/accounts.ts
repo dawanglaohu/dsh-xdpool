@@ -1007,6 +1007,12 @@ export class WorkBuddyAccountPool {
       const stored = await loadStoredAccounts(this.storePath)
       for (const entry of stored) {
         if (byId.has(entry.id)) continue
+        // The ignore gate runs on files and on the channel source above, but the
+        // store is a third way in — and the one that outlives the process. An id
+        // the user threw out stays in the file until a scan rewrites it, so
+        // seeding it would put the account back on the card (and back in the
+        // file) after every restart, making "remove" look broken.
+        if (this.ignoredIds.has(entry.id)) continue
         byId.set(entry.id, {
           id: entry.id,
           label: entry.label,

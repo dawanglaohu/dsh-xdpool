@@ -25,7 +25,7 @@
  * now a scan source, and the plugin's own state files in it are excluded.
  */
 
-import { existsSync, mkdirSync, mkdtempSync, writeFileSync, rmSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
@@ -162,6 +162,34 @@ describe('the durable account store', () => {
     const accounts = await new WorkBuddyAccountPool({ authDirs: [authDir], persistent: true }).scan()
     expect(accounts).toHaveLength(1)
     expect(accounts[0]?.label).toContain('dave')
+  })
+
+  it('does not seed an account the user removed, even though the store still lists it', async () => {
+    // The store is written by the scan that ran BEFORE the removal, so the id is
+    // still in the file. Startup applies the ignore list first and scans second
+    // (`index.ts`), so the seed has to honour it — otherwise every restart puts
+    // the account back on the card and back into the store.
+    const home = tempHome()
+    cleanups.push(() => rmSync(home, { recursive: true, force: true }))
+    mkdirSync(join(home, '.xdpool'), { recursive: true })
+    const removed = parsedCredential('removed')
+    writeFileSync(join(home, '.xdpool', ACCOUNTS_FILE_NAME), JSON.stringify({
+      version: 1,
+      accounts: [
+        { id: workbuddyAccountId(removed), label: 'Removed', credential: removed, savedAtMs: Date.now() },
+        { id: 'kept-id', label: 'Kept', credential: parsedCredential('kept'), savedAtMs: Date.now() },
+      ],
+    }))
+
+    const pool = new WorkBuddyAccountPool({ authDirs: [], persistent: true })
+    pool.applyIgnored([workbuddyAccountId(removed)])
+    const accounts = await pool.scan()
+
+    expect(accounts.map(account => account.label)).toEqual(['Kept'])
+    // And the rewrite drops it too, so the next process has nothing to seed.
+    const round = JSON.parse(readFileSync(accountStorePath(), 'utf8'))
+    expect(round.accounts).toHaveLength(1)
+    expect(round.accounts[0].label).toBe('Kept')
   })
 
   it('never re-reads its own state files as credentials', async () => {
