@@ -20,8 +20,13 @@ const pkg = JSON.parse(readFileSync(join(ROOT, 'package.json'), 'utf8')) as {
   engines?: Record<string, string>
   peerDependencies?: Record<string, string>
   version?: string
+  dsh?: {
+    bundle?: { patch?: string; platforms?: unknown }
+    client?: { inject?: readonly string[], platform?: string }
+  }
 }
 const readme = readFileSync(join(ROOT, 'README.md'), 'utf8')
+const adapterSource = readFileSync(join(ROOT, 'src', 'adapter.ts'), 'utf8')
 
 describe('engines.dsh admits the generation that actually works', () => {
   it('allows 0.2.x', () => {
@@ -81,5 +86,53 @@ describe('the README points at the entry point that exists', () => {
   it('does not still claim adaptation to the 0.1.2 host alone', () => {
     expect(readme).not.toContain('已针对 DSH Desktop host `0.1.2` 适配')
     expect(readme).toContain('0.2.0')
+  })
+})
+
+describe('the image budgets keep the 0.2.2 count fields', () => {
+  // dsh-llm-pi-ai 0.2.2 made `maxRequestImages` and `imageOffloadCountQuantum`
+  // REQUIRED on `ResolvedPiAiProviderProfile`. We build that profile by hand, so
+  // the compiler already refuses a regression — but only while the dependency is
+  // the 0.2.2 generation. Pinned back to 0.2.1 (or a future line that renames
+  // them) the type check goes quiet again while the runtime consequence stays:
+  // `requiredImageOffload()` reads `budget.maxImages === undefined ? 0 : …`, so a
+  // missing field silently disables the whole image-COUNT bound and leaves only
+  // the 20 MB byte budget. Nothing throws; requests just carry far more images
+  // than intended, and the offload step degrades to one image at a time.
+  it('declares both count fields', () => {
+    expect(adapterSource).toMatch(/\bmaxRequestImages:\s*\d+/)
+    expect(adapterSource).toMatch(/\bimageOffloadCountQuantum:\s*\d+/)
+  })
+
+  it('keeps the quantum within the count bound', () => {
+    const count = /maxRequestImages:\s*(\d+)/.exec(adapterSource)?.[1]
+    const quantum = /imageOffloadCountQuantum:\s*(\d+)/.exec(adapterSource)?.[1]
+    expect(count, 'maxRequestImages must be a literal so this check can read it').toBeDefined()
+    expect(quantum, 'imageOffloadCountQuantum must be a literal so this check can read it').toBeDefined()
+    // The upstream validator states the same rule:
+    // "imageOffloadCountQuantum must be a positive safe integer no greater than
+    // maxRequestImages". It only runs on the config-driven path, which we bypass.
+    expect(Number(quantum)).toBeGreaterThan(0)
+    expect(Number(quantum)).toBeLessThanOrEqual(Number(count))
+  })
+})
+
+describe('the bundle platform gate stays declarative', () => {
+  // 0.2.2's app-boot validates `dsh.bundle.platforms` and refuses to start when
+  // the Host is not in it. Omitted means "every platform", so declaring it is a
+  // tightening — and a mistyped entry would turn a working install into a
+  // startup refusal, which is a far worse failure than the one it guards.
+  it('names Node platform ids, not marketing names', () => {
+    const platforms = pkg.dsh?.bundle?.platforms
+    expect(Array.isArray(platforms), 'declared platforms must be a list').toBe(true)
+    const list = platforms as readonly unknown[]
+    expect(list.length).toBeGreaterThan(0)
+    for (const platform of list) {
+      expect(typeof platform).toBe('string')
+      // `process.platform` values only. "windows" or "macos" would be rejected
+      // by assertBundlePlatform() as invalid metadata and block startup.
+      expect(['aix', 'android', 'darwin', 'freebsd', 'haiku', 'linux', 'openbsd',
+        'sunos', 'win32', 'cygwin', 'netbsd']).toContain(platform)
+    }
   })
 })

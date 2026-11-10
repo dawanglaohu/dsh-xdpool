@@ -1,6 +1,48 @@
 # Changelog
 本项目的所有重要变更都会记录在此文件。
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
+## 2.5.8 — 跟上 DSH 0.2.2：图像数量预算补齐、模型徽章改用宿主的 badge 通道
+> DSH 0.2.2-rc.1（2026-11-04）对我们只有一个**硬破坏**：`ResolvedPiAiProviderProfile` 多了两个必填字段。它不是编译期才出现的麻烦 —— 旧代码在 0.2.2 上仍然编译不过就是编译不过，而没有这两个字段的 profile 又不会报错，只会让「一次能塞多少张图」这件事**静默失效**。
+
+### 硬破坏：pi-ai 给 provider profile 加了两个必填字段
+0.2.2 的 `@deepseek-ai/dsh-llm-pi-ai` 在 `ResolvedPiAiProviderProfile` 里新增 `maxRequestImages: number` 与 `imageOffloadCountQuantum: number`（`lib/types/config.d.ts`）。我们在 `src/adapter.ts` 里直接构造这个 profile，于是 `npx tsc` 报一条：
+
+```
+src/adapter.ts(394,9): error TS2739: Type '{ maxRequestImageBytes: …; piProvider: …; }'
+  is missing the following properties from type 'ResolvedPiAiProviderProfile':
+  maxRequestImages, imageOffloadCountQuantum
+```
+
+**为什么运行时不会自己兜住**：那两个默认值（`maxRequestImages ?? 50`、`imageOffloadCountQuantum ?? Math.min(10, maxRequestImages)`）只写在 `resolveProfiles()` 这条**配置驱动**路径上（`lib/index.js:1120`），而我们走的是 `new PiAiAdapter({ profiles: () => profiles, … })` 回调，一个 z schema 都不经过。漏字段的后果不是抛错，而是 `requiredImageOffload()` 里 `excessCount = budget.maxImages === undefined ? 0 : …` 恒为 0 —— 图片**数量**上限整条失效，只剩 20 MB 的字节上限拦着；顺带 offload 步进退化成 1，一次只能甩掉一张。
+
+### 改动
+1. **`src/adapter.ts` 的 `REQUEST_IMAGE_BUDGETS` 补两字段**：`maxRequestImages: 50` / `imageOffloadCountQuantum: 10`，取 0.2.2 自己的默认值，与宿主配置驱动路径的结果一致。profile 字面量靠 `...REQUEST_IMAGE_BUDGETS` 展开，别处不用动。0.2.1 上多出这两个字段也只是结构化赋值的余量，双向都能编译。
+2. **模型徽章改走宿主的 `badge` 通道**：0.2.2 给 `LlmModelInfo` 加了可选的 `badge?: { text: LocalizedText; tone: 'neutral'|'info'|'success'|'warning' }`，模型选择器会把它画成 `Tag`（trigger 位置在名字前、菜单项在名字后），而 0.2.1 的 listing mapper 只重建四个字段、会把它丢掉。做法是**双通道 + 运行时探测**：
+   - `src/badges.ts` 新增 `displayBadge()` / `badgeTone()`。色值按**色相**而不是精确 hex 分档（网关用 `#FF0000` 表示限时免费/夜间免费、`#1E90FF` 表示夜间折扣），红→`warning`、绿→`success`、蓝→`info`、其余（含解析不出的灰）→`neutral`。
+   - `displaySuffix()` 拆成速率与促销两段：速率（`x0.79`、`免费`）永远留在 `name` 里 —— 徽章是促销标签，不是价格；促销词只在没有徽章通道时才拼进 `name`。
+   - `PiAiAdapter` 的 `listModels` 是逐字段白名单（`{ provider, id, name, inputModalities }`），**永不转发 badge**，所以 `createWorkBuddyAdapter` 包了一层实例方法来补。徽章**无条件发布**：发布再读回，本来就是探测宿主的手段，被丢掉的字段不会伤害旧宿主。
+   - 启动后 `probeBadgeChannel()` 自己的 `listModels` 确认「我们确实发得出徽章」，再看 `ctx.llm.listModels()` 回来的行里还有没有 `badge`，然后 `setHostKeepsBadges()` 把结果套到四个车道上（只给一个车道换约定会变成支持问题）。fire-and-forget，探测失败只损失徽章通道，不影响已经成功的注册，结果写进 `startup.log`。
+3. **`dsh.bundle.platforms` 显式声明** `["win32","darwin","linux"]`。0.2.2 的 `@dsh-app-boot` 会用 `assertBundlePlatform()` 校验这个字段，**省略等于全平台放行**，所以这不是修复而是收紧：以后哪天误打包一个平台专属产物，宿主会在启动时就拒，而不是等到运行到一半。注意取值必须是 Node 的 `process.platform` 名（`win32`，不是 `windows`）。
+4. **devDependencies 升到 0.2.2-rc.1**（cordis 4.1.0、schemastery 3.19.0），`@deepseek-ai/dsh-client-runtime` 保持 `0.1.1-rc.2`：它在 npm 上没有 0.2.2-rc.1，最高就是 0.1.1-rc.2，跟着写会直接解析失败。`engines.dsh` 与 `peerDependencies` 区间**不动** —— `>=0.1.5-rc.1 <0.3.0` 已经收了 0.2.2，且宿主是用 `semver.satisfies(…, { includePrerelease: true })` 判的。
+
+### 行为变化（不是 bug，升级后会看到）
+- **会话中途的 system 文本在 0.2.2 上会降级成 user 消息**。0.2.2 的 `toPiContext(…, supportsMidConvoSystemMessages = false)` 把历史里每条 `role: 'system'` 改写成 `role: 'user'` 包一层 `<system-reminder>`；只有模型 compat 里显式带 `supportsMidConvoSystemMessages: true` 才保留原角色，而 `openai-completions` 路由在 0.2.2 的门禁表里被标成 `"withhold"`。我们的 `SHIM_COMPAT` 只有 `supportsDeveloperRole: false`，所以**走的就是降级路径**。对 WorkBuddy 这种 OpenAI 兼容上游，这通常更安全（中途 system 更容易被拒），因此这次不主动开；真机确认上游接受后再加一个字段即可。
+- **`DEFAULT_CONTEXT_WINDOW` 262144→1e6、`DEFAULT_MAX_TOKENS` 32768→128e3** 与我们无关：它们是**配置驱动** provider 的 schema 默认值，我们每条模型都显式给 `contextWindow` / `maxTokens`。
+- **cordis 4.1.0 的 `internal/update` 从四参变三参**（`(fiber, resolvedConfig, next)`，另新增 `internal/commit`）与我们无关：本插件不注册任何 `internal/*` hook，不读 `Fiber.store` / `_config`，也不调 `waterfall` / `unregister` / `once`。
+
+### 无关但要记一笔
+- `dsh-llm` 的 `index.d.ts`、`dsh-client-ui-slots`、`dsh-settings`、`dsh-credentials` 的全部 `*.d.ts` 与 0.2.1 逐字相同。
+- `dsh-client-locale` 只是把 `register()` 的第二参放宽成 `Record<BuiltInLocaleId, …> & Record<LocaleId, …>`（新增的六种语言是可选的），`{ zh, en }` 照旧合法。
+- `dsh-attachment` 的 `AttachmentAdmissionPart` 多了一个「已存图引用 + `encodedBytes`」分支，我们不构造这个 union，只把服务转给宿主。
+- `dsh-client-ui-primitives` 增删了一批组件，本插件对它零 import。
+- `llm/models-updated` 事件 0.2.2 **只有类型声明、没有运行时 emit 点**，现在监听它没有意义；`llm/adapters-updated` 仍是唯一实际广播。
+
+### 验证
+- `npx tsc -p tsconfig.json --noEmit` 在 **0.2.2-rc.1** 依赖下零错误；devDependencies 回钉到 0.2.1-rc.5 时同样零错误（新增的两个字段只是结构化赋值的余量），双向都能编译。
+- `npx vitest run` **93 文件 / 1173 条全绿**。新增 `tests/badge-channel.test.ts`（12 条）：色相分档（含 3/4/6/8 位 hex）、两个词表合并去重、`listModels` 无条件发布徽章、`hy3` 取网关措辞而不是「免费」、以及两个通道下 `glm-5.2` 的显示名（`GLM-5.2 · x0.79 · 夜间折扣` ↔ `GLM-5.2 · x0.79`）。`tests/compatibility-declaration.test.ts` 加了两组断言：图像数量预算里两个字段存在且 `imageOffloadCountQuantum ≤ maxRequestImages`、`dsh.bundle.platforms` 只含合法的 `process.platform` 名。
+- `node scripts/check-adoption.mjs`：manifest / bundle / apply 三项 PASS；`installed-bytes-match-build` 报 differ 是**预期**的 —— 它比的是 `C:\Users\admin\.dsh\profiles\desktop\node_modules\dsh-xdpool\lib` 与工作区，而那个副本是上一次安装留下的，本地改完还没重新装进去。发布前重装一次即可对上。
+- 已知不稳定用例：`tests/pool-priority.test.ts:192` 与 `tests/preferred-account.test.ts` 在并发下有随机超时，单独重跑均通过，与本次改动无关。
+
 ## 2.5.7 — 删掉的账号会在下次启动时自己回来：存储播种绕过了忽略名单
 
 ### 现象

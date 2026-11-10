@@ -97,6 +97,102 @@ export function badgeLabels(tags: readonly string[] | undefined): readonly strin
   return parseBadgeTags(tags).map(badge => badge.label)
 }
 
+/** The tones the host's model picker knows how to paint a badge in. */
+export type ModelBadgeTone = 'neutral' | 'info' | 'success' | 'warning'
+
+/**
+ * One badge in the shape of `LlmModelInfo['badge']` (dsh-llm >= 0.2.2).
+ *
+ * Declared here instead of imported: that type does not exist on the 0.1/0.2.1
+ * line this package still compiles against, and importing a missing export is a
+ * hard build failure rather than a capability that can degrade. The host
+ * shallow-copies whatever we hand it (`text` may be a literal or a locale map),
+ * so a string literal is the portable form.
+ */
+export interface ModelBadge {
+  text: string
+  tone: ModelBadgeTone
+}
+
+/** `#RGB` / `#RGBA` / `#RRGGBB` / `#RRGGBBAA` to three 0–255 channels. */
+function parseColor(color: string | undefined): readonly [number, number, number] | undefined {
+  if (color === undefined) return undefined
+  const hex = color.replace(/^#/, '')
+  const expanded = hex.length === 3 || hex.length === 4
+    ? hex.slice(0, 3).split('').map(digit => digit + digit).join('')
+    : hex.slice(0, 6)
+  if (!/^[0-9A-Fa-f]{6}$/.test(expanded)) return undefined
+  return [
+    Number.parseInt(expanded.slice(0, 2), 16),
+    Number.parseInt(expanded.slice(2, 4), 16),
+    Number.parseInt(expanded.slice(4, 6), 16),
+  ] as const
+}
+
+/** Hue in degrees, or `undefined` for a colourless grey (no promotion intent). */
+function hueOf(rgb: readonly [number, number, number]): number | undefined {
+  const [r, g, b] = rgb
+  const max = Math.max(r, g, b)
+  const min = Math.min(r, g, b)
+  if (max === min) return undefined
+  const span = max - min
+  const raw = max === r ? ((g - b) / span) % 6 : max === g ? (b - r) / span + 2 : (r - g) / span + 4
+  const hue = raw * 60
+  return hue < 0 ? hue + 360 : hue
+}
+
+/**
+ * Translate the upstream's hex colour into the host's four-tone vocabulary.
+ *
+ * The gateway picks colours to signal urgency (`#FF0000` for 限时免费 and
+ * 夜间免费, `#1E90FF` for 夜间折扣), and the host's badge only accepts a tone.
+ * Mapping by hue instead of by an exact hex string keeps this working when the
+ * gateway switches to a different red. An unrecognised or grey colour falls
+ * back to `neutral`, which renders the label without claiming a severity the
+ * upstream never expressed.
+ */
+export function badgeTone(color: string | undefined): ModelBadgeTone {
+  const rgb = parseColor(color)
+  const hue = rgb === undefined ? undefined : hueOf(rgb)
+  if (hue === undefined) return 'neutral'
+  if (hue < 70 || hue >= 330) return 'warning'
+  if (hue < 165) return 'success'
+  if (hue < 265) return 'info'
+  return 'neutral'
+}
+
+/**
+ * The badge to publish on `LlmModelInfo.badge`, or `undefined` when the row
+ * carries no promotion.
+ *
+ * `extraLabels` are the promotions this plugin derives from the gateway's older
+ * vocabulary (`free` / `limited-free` / `night-discount`). They are folded into
+ * the same badge so that a caller switching channels has exactly one source of
+ * promotion text: the union is computed here once, and whichever channel is in
+ * use prints the same words in the same order.
+ *
+ * Every label is kept and joined, because the display name this replaces showed
+ * all of them and dropping the second half would silently narrow what the
+ * upstream said. The tone comes from the first badge that named a colour — a
+ * label without one cannot express a severity, so it does not vote.
+ */
+export function displayBadge(
+  tags: readonly string[] | undefined,
+  extraLabels: readonly string[] = [],
+): ModelBadge | undefined {
+  const badges = parseBadgeTags(tags)
+  const labels: string[] = []
+  for (const label of [...extraLabels, ...badges.map(badge => badge.label)]) {
+    if (!labels.includes(label)) labels.push(label)
+  }
+  if (labels.length === 0) return undefined
+  const coloured = badges.find(badge => badge.color !== undefined)
+  return {
+    text: labels.join(' · '),
+    tone: badgeTone(coloured?.color),
+  }
+}
+
 /**
  * Whether a zero price should be spelled out as the generic `免费` label.
  *

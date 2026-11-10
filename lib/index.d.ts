@@ -3075,6 +3075,18 @@ interface WorkBuddyAdapter {
   buildModels: () => Model<Api>[];
   /** Rebuild the adapter's provider snapshot; call after a catalog update. */
   invalidate: () => void;
+  /**
+   * Tell this adapter whether the running host keeps `LlmModelInfo.badge`.
+   *
+   * It does from dsh-llm 0.2.2 onward; before that the host's listing mapper
+   * rebuilds every row from four fields and drops the badge on the floor. That
+   * is not something a version string can answer — the host is upgraded
+   * independently of this plugin — so the caller probes the live answer and
+   * reports it here. `true` moves the promotion labels onto the badge channel;
+   * `false` keeps them in the display name, where every host since 0.1.2 has
+   * rendered them.
+   */
+  setHostKeepsBadges: (keeps: boolean) => void;
 }
 /**
  * Assemble the adapter. `getModels` re-reads the live catalog, and every

@@ -716,6 +716,45 @@ function warnOnPiAiGenerationMismatch(ctx: Context): void {
   }
 }
 /**
+ * Ask the running host whether `LlmModelInfo.badge` survives to the picker.
+ *
+ * The answer is a property of the host's own listing mapper, not of any version
+ * this plugin can read: dsh-llm rebuilds every row from a fixed field list on
+ * the way out, and only 0.2.2 started copying `badge` through that list. Since
+ * the host is upgraded on its own schedule, the only trustworthy answer is the
+ * live one — publish a badge and see whether it comes back.
+ *
+ * Returns `true` when the host kept it. Everything else (an empty listing, a
+ * catalog with no promotions to show, a host that refuses to list) returns
+ * `false`, which is also the state the adapters start in: promotions then stay
+ * in the display name, where every host since 0.1.2 has rendered them. A failed
+ * probe therefore costs nothing but the badge channel.
+ */
+async function probeBadgeChannel(
+  ctx: Context,
+  adapters: { readonly cn: WorkBuddyAdapter, readonly global: WorkBuddyAdapter,
+    readonly aggregate: WorkBuddyAdapter, readonly free: WorkBuddyAdapter },
+): Promise<boolean> {
+  /** The one field this probe is about; `LlmModelInfo` lacks it before 0.2.2. */
+  type MaybeBadged = { readonly badge?: unknown }
+  const provider = adapters.cn.providerId
+  // Ours first: without a promotion on any row there is nothing to observe, and
+  // "the host dropped a badge we never published" would be a wrong conclusion.
+  const own = await adapters.cn.adapter.listModels(provider)
+  if (!own.some(row => (row as MaybeBadged).badge !== undefined)) return false
+  const listed = await ctx.llm.listModels(provider) as unknown as readonly MaybeBadged[]
+  const keeps = listed.some(row => row.badge !== undefined)
+  // Applied to every lane even though only the pool lanes carry promotions: the
+  // flag also decides which channel the display name is built for, and leaving
+  // four adapters on two different display conventions would be a support
+  // question waiting to happen.
+  adapters.cn.setHostKeepsBadges(keeps)
+  adapters.global.setHostKeepsBadges(keeps)
+  adapters.aggregate.setHostKeepsBadges(keeps)
+  adapters.free.setHostKeepsBadges(keeps)
+  return keeps
+}
+/**
  * Start the loopback endpoint, register the `xdpool` provider, and
  * discover accounts. The provider registers only after `shim.ready` resolves,
  * because its models read the shim origin at construction time.
@@ -1952,6 +1991,25 @@ function canonicalJson(value: unknown): string {
         // that into a named file and a named replacement.
         recordStartupNote(describeProviderIdRename())
         builtAdapter = adaptersByRegion.cn
+        // Ask the RUNNING host whether it keeps `LlmModelInfo.badge`, rather than
+        // guessing from a version string: the host is upgraded on its own
+        // schedule, and the field's fate is decided by one mapper inside
+        // dsh-llm that only 0.2.2 started copying through. Publishing a badge
+        // and reading it back is the only answer that cannot go stale.
+        //
+        // Both outcomes are correct displays. `true` moves the promotion labels
+        // off the model name and onto the badge, which the picker renders as a
+        // coloured tag; `false` keeps them in the name, where every host since
+        // 0.1.2 has drawn them.
+        //
+        // Deliberately fire-and-forget and per-lane: this runs during startup,
+        // and a host that answers slowly (or not at all) must cost the badge
+        // channel alone — never the registration that already succeeded above.
+        void probeBadgeChannel(ctx, adaptersByRegion).then((keeps) => {
+          recordStartupNote(`model badge channel ${keeps ? 'kept' : 'dropped'} by host`)
+        }, (error: unknown) => {
+          recordStartupNote(`model badge probe failed: ${describeError(error)}`)
+        })
         // From here on a settings change can rebuild the picker. Until this line
         // runs, `invalidateCatalog` is the no-op seeded at the top of apply.
         invalidateCatalog = () => {

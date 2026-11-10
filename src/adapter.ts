@@ -17,7 +17,8 @@ import { resolveImageAttachmentAccess, resolveRetryPolicy } from '@deepseek-ai/d
 import { PiAiAdapter } from '@deepseek-ai/dsh-llm-pi-ai'
 import type { ResolvedPiAiProviderProfile } from '@deepseek-ai/dsh-llm-pi-ai'
 import type { Context } from '@deepseek-ai/cordis'
-import { badgeLabels, shouldSpellOutFree } from './badges.ts'
+import { badgeLabels, displayBadge, shouldSpellOutFree } from './badges.ts'
+import type { ModelBadge } from './badges.ts'
 import type { WorkBuddyCatalog, WorkBuddyModelInfo } from './catalog.ts'
 import { isAggregateCatalog, type AggregateCatalog, type AggregateModelRow } from './aggregate.ts'
 import type { ComboModelRow } from './combos.ts'
@@ -87,6 +88,8 @@ const REQUEST_IMAGE_BUDGETS = {
   maxRequestImageBytes: 20_971_520,
   requestImagePixelBudget: 4_194_304,
   requestImageMaxBytes: 1_048_576,
+  maxRequestImages: 50,
+  imageOffloadCountQuantum: 10,
 } as const
 /**
  * Inert pi-ai auth plane. The route authenticates only through the shim shared
@@ -136,6 +139,18 @@ export interface WorkBuddyAdapter {
   buildModels: () => Model<Api>[]
   /** Rebuild the adapter's provider snapshot; call after a catalog update. */
   invalidate: () => void
+  /**
+   * Tell this adapter whether the running host keeps `LlmModelInfo.badge`.
+   *
+   * It does from dsh-llm 0.2.2 onward; before that the host's listing mapper
+   * rebuilds every row from four fields and drops the badge on the floor. That
+   * is not something a version string can answer — the host is upgraded
+   * independently of this plugin — so the caller probes the live answer and
+   * reports it here. `true` moves the promotion labels onto the badge channel;
+   * `false` keeps them in the display name, where every host since 0.1.2 has
+   * rendered them.
+   */
+  setHostKeepsBadges: (keeps: boolean) => void
 }
 /** pi-ai input modalities: images only when the catalog advertises them. */
 function modelInput(info: WorkBuddyModelInfo): ('text' | 'image')[] {
@@ -158,6 +173,16 @@ function modelInput(info: WorkBuddyModelInfo): ('text' | 'image')[] {
  * reaches it, but the request should never leave pi-ai carrying a role the
  * gateway rejects — a backstop that rewrites the wire is a bug report waiting
  * to happen the moment the shim is bypassed.
+ *
+ * `supportsMidConvoSystemMessages` is deliberately ABSENT, and absent is not the
+ * same as forgotten. From 0.2.2 the host reads that flag to decide whether a
+ * mid-conversation `system` turn can be replayed as one; without it every such
+ * turn is rewritten to `role: "user"` wrapped in `<system-reminder>`. That is
+ * the safer shape for an OpenAI-compatible gateway — a role the gateway never
+ * expected mid-stream is a 400, while a user-role reminder is merely less
+ * emphatic — so the default worth keeping is the withheld one. Setting it to
+ * `true` is only correct after a live check that WorkBuddy accepts a mid-convo
+ * system turn; nothing in the catalog advertises that capability today.
  */
 const SHIM_COMPAT = { supportsDeveloperRole: false } as const
 /** Map only levels the catalog advertises; undeclared DSH levels stay off. */
@@ -181,61 +206,105 @@ const TAG_LABEL: Readonly<Record<string, string>> = {
   'limited-free': '限时免费',
   'night-discount': '夜间折扣',
 }
-/** Resolve the display suffix (`xN.NN`, promo badges) for one catalog row.
- *  Returns `undefined` when there's nothing to show — the name is left alone
- *  so we don't tack a trailing separator on a plain model. */
-function displaySuffix(info: WorkBuddyModelInfo): string | undefined {
-  const parts: string[] = []
-  // `multiplier: 0` is the gateways' own spelling of "free" (`credits:
-  // "x0.00"`), so it prints as the free badge instead of "x0.00" — which read
-  // as a zero-cost rate and carried no promo label at all.
-  //
-  // `shouldSpellOutFree` suppresses that when the gateway ALSO badged the row:
-  // `hy3` arrives as `multiplier: 0` AND `badge:限时免费`, and emitting both
-  // rendered the one fact twice ("免费 · 限时免费"). The gateway's own wording is
-  // the more informative of the two, so it wins — and the badge loop below
-  // supplies it.
-  if (shouldSpellOutFree(info)) {
-    parts.push('免费')
-  } else if (
-    // The `!== 0` guard is load-bearing, not redundant: a zero-priced row that
-    // carries a badge falls through BOTH branches, and without the guard it
-    // would print the bare rate "x0.00" that the badge exists to replace.
+/** The rate half of the display suffix, or `undefined` for an unpriced row.
+ *
+ *  `multiplier: 0` is the gateways' own spelling of "free" (`credits: "x0.00"`),
+ *  so it prints as the free label instead of "x0.00" — which read as a zero-cost
+ *  rate and carried no promo label at all.
+ *
+ *  `shouldSpellOutFree` suppresses that when the gateway ALSO badged the row:
+ *  `hy3` arrives as `multiplier: 0` AND `badge:限时免费`, and emitting both
+ *  rendered the one fact twice ("免费 · 限时免费"). The gateway's own wording is
+ *  the more informative of the two, so it wins — and {@link promoLabels}
+ *  supplies it on whichever channel is active.
+ *
+ *  `!== 0` is load-bearing, not redundant: a zero-priced row that carries a
+ *  badge falls through BOTH branches, and without the guard it would print the
+ *  bare rate "x0.00" that the badge exists to replace.
+ */
+function rateSuffix(info: WorkBuddyModelInfo): string | undefined {
+  if (shouldSpellOutFree(info)) return '免费'
+  if (
     info.multiplier !== 0
     && typeof info.multiplier === 'number'
     && Number.isFinite(info.multiplier)
   ) {
-    parts.push(`x${info.multiplier.toFixed(2)}`)
+    return `x${info.multiplier.toFixed(2)}`
   }
+  return undefined
+}
+/** Every promotion label one row carries, upstream order.
+ *
+ *  Two vocabularies reach us and both are shown. `TAG_LABEL` covers the older
+ *  bare codes (`free` / `limited-free` / `night-discount`); the gateway also
+ *  writes promotions as `badge:<label>:#RRGGBB`, which that table never
+ *  matched, so a model the gateway had explicitly marked as promoted used to
+ *  render like any paid one. Those are shown verbatim: the label is already the
+ *  string a user should read, and translating it here would need a table that
+ *  goes stale the first time a badge is reworded.
+ *
+ *  This is the single list both display channels draw from, so switching
+ *  channels cannot change which promotions appear or in what order.
+ */
+function promoLabels(info: WorkBuddyModelInfo): readonly string[] {
+  const labels: string[] = []
   for (const tag of info.tags ?? []) {
     const label = TAG_LABEL[tag]
-    if (label !== undefined && !parts.includes(label)) parts.push(label)
+    if (label !== undefined && !labels.includes(label)) labels.push(label)
   }
-  // The gateway ALSO writes promotions into `tags` as `badge:<label>:#RRGGBB`,
-  // which TAG_LABEL above never matched, so a model the gateway had explicitly
-  // marked as promoted used to render like any paid one. Shown verbatim: the
-  // label is already the string a user should read, and translating it here
-  // would need a table that goes stale the first time a badge is reworded.
   for (const label of badgeLabels(info.tags)) {
-    if (!parts.includes(label)) parts.push(label)
+    if (!labels.includes(label)) labels.push(label)
+  }
+  return labels
+}
+/** Resolve the display suffix (`xN.NN`, promo labels) for one catalog row.
+ *  Returns `undefined` when there's nothing to show — the name is left alone
+ *  so we don't tack a trailing separator on a plain model.
+ *
+ *  `promotionsInName` is false once the host is known to carry
+ *  `LlmModelInfo.badge`: the promotions then ride that channel, and repeating
+ *  them in the name would render each one twice. The rate always stays here —
+ *  the badge is a promotion label, not a price. */
+function displaySuffix(info: WorkBuddyModelInfo, promotionsInName: boolean): string | undefined {
+  const parts: string[] = []
+  const rate = rateSuffix(info)
+  if (rate !== undefined) parts.push(rate)
+  if (promotionsInName) {
+    for (const label of promoLabels(info)) {
+      if (!parts.includes(label)) parts.push(label)
+    }
   }
   return parts.length === 0 ? undefined : parts.join(DISPLAY_SEPARATOR)
 }
-/** Apply the catalog's rate + promo badges to one model's display name.
+/** Apply the catalog's rate + promo labels to one model's display name.
  *  Display-only: the wire request is built from `model.id`, so renaming here
  *  cannot affect routing, token, or upstream accounting. DSH 0.1.2's composer
- *  (`ModelSelect`) renders `model.name` only, which is why the rate and
- *  badges ride the name rather than a separate description column. */
-function withCatalogDisplay(name: string, info: WorkBuddyModelInfo): string {
-  const suffix = displaySuffix(info)
+ *  (`ModelSelect`) renders `model.name` only, which is why the rate and, on
+ *  hosts without a badge channel, the promotions ride the name. */
+function withCatalogDisplay(name: string, info: WorkBuddyModelInfo, promotionsInName: boolean): string {
+  const suffix = displaySuffix(info, promotionsInName)
   return suffix === undefined ? name : `${name}${DISPLAY_SEPARATOR}${suffix}`
 }
-/** Build one pi-ai model descriptor pointing at the loopback shim. */
-function toPiModel(info: WorkBuddyModelInfo, baseUrl: string, providerId: string): Model<Api> {
+/** The promotion badge for one row, or `undefined` when it carries none. */
+function modelBadge(info: WorkBuddyModelInfo): ModelBadge | undefined {
+  return displayBadge(info.tags, promoLabels(info))
+}
+/** Build one pi-ai model descriptor pointing at the loopback shim.
+ *
+ *  `promotionsInName` decides whether the promotion labels ride the name; the
+ *  badge for the other channel is looked up separately by
+ *  {@link PiAiAdapter.listModels}, because pi-ai's own `Model` has no badge
+ *  field and nothing downstream of it reads one. */
+function toPiModel(
+  info: WorkBuddyModelInfo,
+  baseUrl: string,
+  providerId: string,
+  promotionsInName: boolean,
+): Model<Api> {
   const map = thinkingLevelMap(info)
   return {
     id: info.id,
-    name: withCatalogDisplay(info.name, info),
+    name: withCatalogDisplay(info.name, info, promotionsInName),
     api: 'openai-completions',
     provider: providerId,
     baseUrl,
@@ -357,6 +426,10 @@ export function createWorkBuddyAdapter(options: WorkBuddyAdapterOptions): WorkBu
   const displayName = options.displayName ?? 'XD Pool'
   const aggregateCatalog = isAggregateCatalog(catalog)
   const extraRows = options.extraRows
+  // Defaults to the older channel so a caller that never probes still gets the
+  // promotions rendered somewhere. Only the pool lane has catalog tags to
+  // promote; the other lanes' rows carry none, so the flag never changes them.
+  let hostKeepsBadges = false
   const buildModels = (): Model<Api>[] => {
     const baseUrl = `${shim.baseUrl()}/v1`
     if (extraRows !== undefined) {
@@ -371,7 +444,7 @@ export function createWorkBuddyAdapter(options: WorkBuddyAdapterOptions): WorkBu
         ...catalog.comboRows().map(row => toComboModel(row, baseUrl, providerId)),
       ]
     }
-    return catalog.visible().map(info => toPiModel(info, baseUrl, providerId))
+    return catalog.visible().map(info => toPiModel(info, baseUrl, providerId, !hostKeepsBadges))
   }
   const base = createProvider({
     id: providerId,
@@ -423,12 +496,46 @@ export function createWorkBuddyAdapter(options: WorkBuddyAdapterOptions): WorkBu
     resolveImageAccess: (attachments, ref) =>
       resolveImageAttachmentAccess(attachments, hostPath => options.ctx.get('fs')?.processPathFromHostPath(hostPath), ref),
   })
+  // pi-ai's own `Model` has no badge field, so the host adapter's listing
+  // mapper can only ever echo `{ provider, id, name, inputModalities }` — and
+  // dsh-llm before 0.2.2 drops even `badge` from what it hands upward. The
+  // promotion label therefore has to be attached here, on the one method the
+  // host calls to enumerate a provider's models.
+  //
+  // It is attached unconditionally, not only once the host is known to keep it:
+  // publishing it is how the caller finds out whether the running host keeps it
+  // (see `probeBadgeChannel` in the plugin entry), and a host that drops the
+  // field is not harmed by its presence.
+  const listModelsBase = adapter.listModels.bind(adapter)
+  adapter.listModels = async (provider: string) => {
+    const rows = await listModelsBase(provider)
+    // Only the pool lane's rows carry promotions. The aggregate, chain and free
+    // lanes publish their own names, so there is no catalog row to look up.
+    const byId = new Map<string, WorkBuddyModelInfo>()
+    if (extraRows === undefined && !aggregateCatalog) {
+      for (const info of catalog.visible()) byId.set(info.id, info)
+    }
+    if (byId.size === 0) return rows
+    return rows.map((row) => {
+      const info = byId.get(row.id)
+      const badge = info === undefined ? undefined : modelBadge(info)
+      return badge === undefined ? row : { ...row, badge }
+    })
+  }
   return {
     providerId,
     displayName,
     adapter,
     buildModels,
     invalidate: () => {
+      profiles = new Map<string, ResolvedPiAiProviderProfile>([[providerId, profile]])
+    },
+    setHostKeepsBadges: (keeps: boolean) => {
+      if (keeps === hostKeepsBadges) return
+      hostKeepsBadges = keeps
+      // A fresh Map is a fresh snapshot: the host adapter re-reads `getModels`
+      // off it, which is what puts the other channel's names in front of a
+      // picker that has already drawn this provider once.
       profiles = new Map<string, ResolvedPiAiProviderProfile>([[providerId, profile]])
     },
   }
